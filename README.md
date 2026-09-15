@@ -124,10 +124,12 @@ The virtual identities are:
 | `webproxy` | `*`, `webproxy`, `tardis` |
 
 TLS validation intentionally checks only that the presented leaf certificate
-names the requested host. In addition to normal wildcard matching, a certificate
-for a parent host is accepted as an implicit one-label wildcard for Gemini client
-compatibility (for example, `example.org` names `alice.example.org`). It does not
-use a CA store, TOFU continuity, or certificate expiration as trust policy.
+names the requested host. It accepts a matching subject CN even when the
+certificate also has a nonmatching SAN, as Gemini clients such as Lagrange do.
+In addition to normal wildcard matching, a certificate for a parent host is
+accepted as an implicit one-label wildcard for Gemini client compatibility (for
+example, `example.org` names `alice.example.org`). It does not use a CA store,
+TOFU continuity, or certificate expiration as trust policy.
 
 ## Runtime controls
 

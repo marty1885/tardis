@@ -74,8 +74,14 @@ dremini::ServerTrust hostname_only_trust(std::string hostname,
         const auto pem = certificate ? certificate->pem() : std::string{};
         BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
         X509* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
-        bool accepted =
-            x509 && X509_check_host(x509, hostname.data(), hostname.size(), 0, nullptr) == 1;
+        // Gemini capsules commonly use a subject CN for their hostname while
+        // carrying an unrelated SAN. OpenSSL normally ignores that CN whenever
+        // any SAN is present, whereas Gemini clients such as Lagrange check it.
+        // Keep the usual X.509 wildcard rules, but consult the CN as well.
+        constexpr unsigned hostname_check_flags = X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT;
+        bool accepted = x509 &&
+                        X509_check_host(x509, hostname.data(), hostname.size(),
+                                        hostname_check_flags, nullptr) == 1;
         if (x509 && !accepted) {
             // Gemini clients commonly treat a certificate for example.org as an
             // implicit wildcard for one direct child such as alice.example.org.
@@ -86,7 +92,8 @@ dremini::ServerTrust hostname_only_trust(std::string hostname,
             if (first_dot != std::string::npos && first_dot + 1 < hostname.size()) {
                 const std::string_view parent(hostname.data() + first_dot + 1,
                                               hostname.size() - first_dot - 1);
-                accepted = X509_check_host(x509, parent.data(), parent.size(), 0, nullptr) == 1;
+                accepted = X509_check_host(x509, parent.data(), parent.size(),
+                                           hostname_check_flags, nullptr) == 1;
             }
         }
         std::string der;
