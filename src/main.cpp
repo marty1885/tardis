@@ -30,6 +30,7 @@
 #include "home_controller.hpp"
 #include "media_type.hpp"
 #include "media_type.hpp"
+#include "root_body_store.hpp"
 #include "sandbox.hpp"
 #include "tlgs_url_parser.hpp"
 
@@ -760,6 +761,7 @@ int main(int argc, char** argv) {
         auto server = std::make_shared<dremini::GeminiServer>(
             drogon::app().getLoop(), address, key_file.string(), cert_file.string());
         tardis::sandbox::warm_up_openssl();
+        tardis::warm_up_root_body_store();
         auto api_service = std::make_shared<ApiService>(catalog, clients, archive);
         const auto api_retrieve = [api_service](const drogon::HttpRequestPtr& request,
                                                 std::function<void(const drogon::HttpResponsePtr&)>&& reply,

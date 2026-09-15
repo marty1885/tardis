@@ -94,7 +94,8 @@ target_include_directories(tardis_sandbox PUBLIC src third_party/minijail)
 target_link_libraries(tardis_sandbox PUBLIC tardis_minijail ${SECCOMP_LIBRARY})
 set_target_properties(tardis_sandbox PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
 
-add_executable(tardis src/main.cpp src/home_controller.cpp src/archive_link_rewrite.cpp)
+add_executable(tardis src/main.cpp src/home_controller.cpp src/archive_link_rewrite.cpp
+                    src/root_body_store.cpp)
 target_include_directories(tardis PRIVATE src)
 target_link_libraries(tardis PRIVATE tardis_catalog tardis_api_clients dremini tlgs_url
                                          tardis_sandbox Drogon::Drogon ${TARDIS_SQLITE3_LIBRARY}

@@ -1308,16 +1308,6 @@ void Crawler::finish_worker(bool did_work) {
 }
 
 drogon::Task<void> Crawler::run() {
-    co_await report_progress("starting");
-    progress_timer_ = loop_->runEvery(
-        static_cast<double>(options_.progress_interval.count()), [this] {
-            if (progress_tick_in_flight_)
-                return;
-            progress_tick_in_flight_ = true;
-            drogon::async_run([this]() -> drogon::Task<void> {
-                co_await progress_tick();
-            });
-        });
     while (!stop_requested_) {
         // Do not let a burst of newly recognized automatic targets delay
         // ordinary discovery work.  In particular, one security.txt target
@@ -1353,9 +1343,6 @@ drogon::Task<void> Crawler::run() {
         const auto delay = std::max<std::int64_t>(*ready - now, 1);
         co_await wait_for_stop(static_cast<double>(delay) / 1000.0);
     }
-    loop_->invalidateTimer(progress_timer_);
-    progress_timer_ = {};
-    co_await wait_for_progress_tick();
     while (active_workers_.load(std::memory_order_acquire))
         co_await wait_for_workers();
     co_await drain_checkpoint();
@@ -1369,7 +1356,6 @@ drogon::Task<void> Crawler::run() {
         // the next run so incremental backups remain coarse-grained.
         co_await catalog_.checkpoint_root_shard(root_shard_id_, entries);
     }
-    co_await report_progress(stop_requested_ ? "stopped" : "complete");
 }
 
 drogon::Task<Json::Value> Crawler::status() {

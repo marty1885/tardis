@@ -35,6 +35,12 @@ void warm_up_root_body_store() {
         store.put(digest, "ROOT warmup");
         store.checkpoint();
         store.close();
+        TFile reader((path / "warmup.root").c_str(), "READ");
+        auto* tree = reader.Get<TTree>("bodies");
+        std::vector<unsigned char>* body{};
+        if (reader.IsZombie() || !tree || tree->SetBranchAddress("body", &body) < 0 ||
+            tree->GetEntry(0) <= 0 || !body)
+            throw std::runtime_error("cannot read ROOT warmup body");
         std::filesystem::remove_all(path);
     } catch (...) {
         std::error_code ignored;

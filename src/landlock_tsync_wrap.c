@@ -30,6 +30,8 @@
 #define LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET (1ULL << 0)
 #endif
 
+#define NORTHWIRE_LANDLOCK_ABI_UNIX_SOCKET_MEDIATION 9
+
 struct northwire_landlock_ruleset_attr {
     __u64 handled_access_fs;
     __u64 handled_access_net;
@@ -51,6 +53,14 @@ int __wrap_landlock_create_ruleset(
 {
     if (attr == NULL || flags != 0)
         return __real_landlock_create_ruleset(attr, size, flags);
+    const int abi = __real_landlock_create_ruleset(
+        NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    // ABI 9 introduced pathname UNIX-socket mediation and the scope field.
+    // Asking an ABI-8 kernel to handle either makes ruleset creation fail,
+    // leaving Minijail with an invalid descriptor and no filesystem sandbox.
+    // Retain Minijail's normal Landlock ruleset on older supported kernels.
+    if (abi < NORTHWIRE_LANDLOCK_ABI_UNIX_SOCKET_MEDIATION)
+        return __real_landlock_create_ruleset(attr, size, flags);
     if (size < sizeof(attr->handled_access_fs)) {
         errno = EINVAL;
         return -1;
@@ -66,11 +76,10 @@ int __wrap_landlock_create_ruleset(
 
 int __wrap_landlock_restrict_self(int ruleset_fd, __u32 flags)
 {
-    const int abi = landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
-    if (abi < 9) {
-        if (abi >= 0) errno = EOPNOTSUPP;
-        return -1;
-    }
+    const int abi = __real_landlock_create_ruleset(
+        NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < NORTHWIRE_LANDLOCK_ABI_UNIX_SOCKET_MEDIATION)
+        return __real_landlock_restrict_self(ruleset_fd, flags);
 
     if (allowed_unix_socket_directory != NULL) {
         const int directory_fd = open(allowed_unix_socket_directory, O_PATH | O_DIRECTORY | O_CLOEXEC);

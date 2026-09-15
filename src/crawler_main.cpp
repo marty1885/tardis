@@ -18,16 +18,21 @@
 namespace {
 
 drogon::Task<void> warm_up_resolver() {
-    // Match Northwire's bootstrap: wait for the first lookup to complete so
-    // libc/NSS and Trantor's resolver worker queue are initialized before the
-    // one-way seccomp boundary is installed.
+    // NormalResolver uses a global blocking worker pool.  libc/NSS keeps
+    // resolver state per worker thread, so warming just one lookup can leave
+    // workers which first load NSS after the one-way sandbox boundary.
+    // Queue a burst before waiting to initialize the pool while filesystem
+    // access is still unrestricted.
+    constexpr unsigned kWarmupRequests = 32;
     const auto resolver = trantor::Resolver::newResolver(drogon::app().getLoop());
-    const auto completed = std::make_shared<std::atomic_bool>(false);
-    resolver->resolve("example.com", [completed](const trantor::InetAddress&) {
-        completed->store(true, std::memory_order_release);
-    });
-    for (unsigned attempt = 0; attempt != 100; ++attempt) {
-        if (completed->load(std::memory_order_acquire)) co_return;
+    const auto completed = std::make_shared<std::atomic_uint>(0);
+    for (unsigned request = 0; request != kWarmupRequests; ++request) {
+        resolver->resolve("example.com", [completed](const trantor::InetAddress&) {
+            completed->fetch_add(1, std::memory_order_release);
+        });
+    }
+    for (unsigned attempt = 0; attempt != 500; ++attempt) {
+        if (completed->load(std::memory_order_acquire) == kWarmupRequests) co_return;
         co_await drogon::sleepCoro(drogon::app().getLoop(), 0.01);
     }
     throw std::runtime_error("DNS resolver warmup timed out");
@@ -179,7 +184,14 @@ int main(int argc, char** argv) {
         tardis::warm_up_root_body_store();
         tardis::sandbox::Policy sandbox_policy;
         sandbox_policy.read_only = {"/etc/hosts", "/etc/host.conf", "/etc/nsswitch.conf",
-                                    "/etc/resolv.conf", "/etc/gai.conf"};
+                                    "/etc/resolv.conf", "/etc/gai.conf",
+                                    // nsswitch.conf may load these providers lazily after
+                                    // the Landlock boundary.
+                                    "/usr/lib/libnss_mymachines.so.2",
+                                    "/usr/lib/libnss_resolve.so.2",
+                                    "/usr/lib/libnss_files.so.2",
+                                    "/usr/lib/libnss_myhostname.so.2",
+                                    "/usr/lib/libnss_dns.so.2"};
         sandbox_policy.read_write = {std::filesystem::absolute(options.snapshot_dir)};
 
         std::atomic<int> exit_code{};
@@ -188,6 +200,7 @@ int main(int argc, char** argv) {
              sandbox_policy = std::move(sandbox_policy)]() mutable -> drogon::Task<void> {
                 try {
                     co_await warm_up_resolver();
+                    LOG_INFO << "Starting crawler...";
                     tardis::sandbox::enter(sandbox_policy);
                     co_await crawler.run();
                 } catch (const std::exception& error) {

@@ -2,10 +2,12 @@
 
 #include <drogon/drogon.h>
 #include <libminijail.h>
+#include <linux/netlink.h>
 #include <openssl/kdf.h>
 #include <seccomp.h>
 
 #include <array>
+#include <asm/ioctls.h>
 #include <cerrno>
 #include <cstring>
 #include <memory>
@@ -59,6 +61,14 @@ void allow_write_exclusive_executable_memory(scmp_filter_ctx filter, std::string
                                  std::string(name));
 }
 
+void allow_ioctl(scmp_filter_ctx filter, unsigned long request) {
+    const auto syscall = seccomp_syscall_resolve_name("ioctl");
+    if (syscall == __NR_SCMP_ERROR ||
+        seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall, 1,
+                         SCMP_A1(SCMP_CMP_EQ, static_cast<scmp_datum_t>(request))) != 0)
+        throw std::runtime_error("cannot permit required ioctl request");
+}
+
 void allow_socket(scmp_filter_ctx filter, int family, int type) {
     constexpr scmp_datum_t type_mask = 0x0f;
     const auto syscall = seccomp_syscall_resolve_name("socket");
@@ -67,6 +77,17 @@ void allow_socket(scmp_filter_ctx filter, int family, int type) {
                          SCMP_A0(SCMP_CMP_EQ, static_cast<scmp_datum_t>(family)),
                          SCMP_A1(SCMP_CMP_MASKED_EQ, type_mask, static_cast<scmp_datum_t>(type))) != 0)
         throw std::runtime_error("cannot permit network socket creation");
+}
+
+void allow_route_netlink_socket(scmp_filter_ctx filter) {
+    constexpr scmp_datum_t type_mask = 0x0f;
+    const auto syscall = seccomp_syscall_resolve_name("socket");
+    if (syscall == __NR_SCMP_ERROR ||
+        seccomp_rule_add(filter, SCMP_ACT_ALLOW, syscall, 3,
+                         SCMP_A0(SCMP_CMP_EQ, AF_NETLINK),
+                         SCMP_A1(SCMP_CMP_MASKED_EQ, type_mask, SOCK_RAW),
+                         SCMP_A2(SCMP_CMP_EQ, NETLINK_ROUTE)) != 0)
+        throw std::runtime_error("cannot permit route netlink socket");
 }
 
 void install_seccomp() {
@@ -92,6 +113,8 @@ void install_seccomp() {
         "fsync", "fdatasync", "mkdir", "mkdirat", "unlink", "unlinkat", "rename", "renameat",
         "renameat2", "rmdir", "msync", "copy_file_range", "splice", "sendfile", "connect"});
     for (const auto name : allowed) allow_syscall(filter.get(), name);
+    // The UDP DNS resolver uses this read-only socket-buffer query.
+    allow_ioctl(filter.get(), FIONREAD);
     allow_non_executable_memory(filter.get(), "mmap");
     allow_non_executable_memory(filter.get(), "mprotect");
     allow_write_exclusive_executable_memory(filter.get(), "mmap");
@@ -102,6 +125,7 @@ void install_seccomp() {
         allow_socket(filter.get(), family, SOCK_STREAM);
         allow_socket(filter.get(), family, SOCK_DGRAM);
     }
+    allow_route_netlink_socket(filter.get());
     if (seccomp_load(filter.get()) != 0)
         throw std::runtime_error("cannot load seccomp sandbox");
 }
@@ -133,10 +157,15 @@ void enter(const Policy& policy) {
     // DNS configuration is read lazily by libc/NSS after the sandbox boundary.
     for (const auto* path : {"/etc/hosts", "/etc/host.conf", "/etc/nsswitch.conf", "/etc/resolv.conf", "/etc/gai.conf"})
         require_configured(minijail_add_fs_restriction_ro(jail.get(), path), path);
-    // Some hosts use a direct DNS resolver rather than systemd-resolved. Do
-    // not ask the ABI-9 wrapper to grant a directory that is not present.
-    if (std::filesystem::is_directory("/run/systemd/resolve"))
+    // Some hosts use a direct DNS resolver rather than systemd-resolved. Give
+    // Landlock normal directory access on every supported ABI; ABI 9 also
+    // mediates the pathname UNIX socket itself through the wrapper.
+    if (std::filesystem::is_directory("/run/systemd/resolve")) {
+        const std::filesystem::path resolve_dir{"/run/systemd/resolve"};
+        require_configured(minijail_add_fs_restriction_ro(jail.get(), resolve_dir.c_str()),
+                           resolve_dir);
         northwire_landlock_allow_unix_socket_directory("/run/systemd/resolve");
+    }
     for (const auto& path : policy.read_only)
         require_configured(minijail_add_fs_restriction_ro(jail.get(), path.c_str()), path);
     for (const auto& path : policy.read_write)
