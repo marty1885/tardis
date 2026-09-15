@@ -122,16 +122,19 @@ dremini::ServerTrust hostname_only_trust(std::string hostname,
         X509* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
         bool accepted = x509 && certificate_names_host(x509, hostname);
         if (x509 && !accepted) {
-            // Gemini clients commonly treat a certificate for example.org as an
-            // implicit wildcard for one direct child such as alice.example.org.
-            // X509_check_host only applies wildcard semantics when the certificate
-            // itself contains "*.example.org", so check the immediate parent name
-            // explicitly for compatibility with virtual-hosting capsules.
-            const auto first_dot = hostname.find('.');
-            if (first_dot != std::string::npos && first_dot + 1 < hostname.size()) {
-                const std::string_view parent(hostname.data() + first_dot + 1,
-                                              hostname.size() - first_dot - 1);
-                accepted = certificate_names_host(x509, parent);
+            // Gemini clients such as Lagrange treat an ancestor certificate as
+            // an implicit wildcard. This permits a virtual-hosting certificate
+            // for cities.yesterweb.org to name bk.7z.cities.yesterweb.org.
+            // Do not reduce the candidate below two DNS labels.
+            std::string_view ancestor = hostname;
+            while (!accepted) {
+                const auto first_dot = ancestor.find('.');
+                if (first_dot == std::string_view::npos)
+                    break;
+                ancestor.remove_prefix(first_dot + 1);
+                if (ancestor.find('.') == std::string_view::npos)
+                    break;
+                accepted = certificate_names_host(x509, ancestor);
             }
         }
         std::string der;

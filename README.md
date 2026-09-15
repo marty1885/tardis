@@ -127,10 +127,10 @@ TLS validation intentionally checks only that the presented leaf certificate
 names the requested host. It accepts a matching subject CN even when the
 certificate also has a nonmatching SAN, and accepts wildcard CNs by suffix
 (including `*.com`), as Gemini clients such as Lagrange do. In addition to
-normal wildcard matching, a certificate for a parent host is accepted as an
-implicit one-label wildcard for Gemini client compatibility (for example,
-`example.org` names `alice.example.org`). It does not use a CA store, TOFU
-continuity, or certificate expiration as trust policy.
+normal wildcard matching, a certificate for an ancestor host is accepted as an
+implicit wildcard for Gemini client compatibility (for example,
+`cities.yesterweb.org` names `bk.7z.cities.yesterweb.org`). It does not use a
+CA store, TOFU continuity, or certificate expiration as trust policy.
 
 ## Runtime controls
 
