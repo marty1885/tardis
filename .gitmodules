@@ -1,0 +1,6 @@
+[submodule "dremini"]
+	path = third_party/dremini
+	url = https://github.com/marty1885/dremini.git
+[submodule "minijail"]
+	path = third_party/minijail
+	url = https://chromium.googlesource.com/chromiumos/platform/minijail.git
