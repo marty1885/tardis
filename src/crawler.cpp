@@ -66,6 +66,52 @@ std::string hash_key(const Hash256& hash) {
     return {reinterpret_cast<const char*>(hash.data()), hash.size()};
 }
 
+bool ascii_case_equal(std::string_view left, std::string_view right) {
+    return left.size() == right.size() &&
+           std::equal(left.begin(), left.end(), right.begin(), [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) ==
+                      std::tolower(static_cast<unsigned char>(b));
+           });
+}
+
+bool subject_common_name_wildcard_matches(X509* x509, std::string_view hostname) {
+    const auto* subject = X509_get_subject_name(x509);
+    for (int entry_index = -1;
+         (entry_index = X509_NAME_get_index_by_NID(subject, NID_commonName, entry_index)) >= 0;) {
+        const auto* entry = X509_NAME_get_entry(subject, entry_index);
+        const auto* value = X509_NAME_ENTRY_get_data(entry);
+        const auto value_length = ASN1_STRING_length(value);
+        const auto* value_data = ASN1_STRING_get0_data(value);
+        if (!value_data || value_length < 3)
+            continue;
+        const std::string_view name(reinterpret_cast<const char*>(value_data),
+                                    static_cast<std::size_t>(value_length));
+        if (!name.starts_with("*."))
+            continue;
+        const auto suffix = name.substr(1);  // Retain the leading dot.
+        if (hostname.size() > suffix.size() &&
+            ascii_case_equal(hostname.substr(hostname.size() - suffix.size()), suffix))
+            return true;
+    }
+    return false;
+}
+
+bool certificate_names_host(X509* x509, std::string_view hostname) {
+    // Gemini capsules commonly use a subject CN for their hostname while
+    // carrying an unrelated SAN. OpenSSL normally ignores that CN whenever
+    // any SAN is present, whereas Gemini clients such as Lagrange check it.
+    // Keep the usual X.509 wildcard rules, but consult the CN as well.
+    constexpr unsigned hostname_check_flags = X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT;
+    if (X509_check_host(x509, hostname.data(), hostname.size(), hostname_check_flags, nullptr) == 1)
+        return true;
+
+    // OpenSSL deliberately rejects a public-suffix wildcard such as "*.com".
+    // Gemini's TOFU-oriented clients, including Lagrange, accept a wildcard CN
+    // by suffix. Match that compatibility rule only after the normal X.509
+    // hostname check has rejected the certificate.
+    return subject_common_name_wildcard_matches(x509, hostname);
+}
+
 dremini::ServerTrust hostname_only_trust(std::string hostname,
                                          std::shared_ptr<std::string> accepted_certificate) {
     return [hostname = std::move(hostname), accepted_certificate = std::move(accepted_certificate)](
@@ -74,14 +120,7 @@ dremini::ServerTrust hostname_only_trust(std::string hostname,
         const auto pem = certificate ? certificate->pem() : std::string{};
         BIO* bio = BIO_new_mem_buf(pem.data(), static_cast<int>(pem.size()));
         X509* x509 = bio ? PEM_read_bio_X509(bio, nullptr, nullptr, nullptr) : nullptr;
-        // Gemini capsules commonly use a subject CN for their hostname while
-        // carrying an unrelated SAN. OpenSSL normally ignores that CN whenever
-        // any SAN is present, whereas Gemini clients such as Lagrange check it.
-        // Keep the usual X.509 wildcard rules, but consult the CN as well.
-        constexpr unsigned hostname_check_flags = X509_CHECK_FLAG_ALWAYS_CHECK_SUBJECT;
-        bool accepted = x509 &&
-                        X509_check_host(x509, hostname.data(), hostname.size(),
-                                        hostname_check_flags, nullptr) == 1;
+        bool accepted = x509 && certificate_names_host(x509, hostname);
         if (x509 && !accepted) {
             // Gemini clients commonly treat a certificate for example.org as an
             // implicit wildcard for one direct child such as alice.example.org.
@@ -92,8 +131,7 @@ dremini::ServerTrust hostname_only_trust(std::string hostname,
             if (first_dot != std::string::npos && first_dot + 1 < hostname.size()) {
                 const std::string_view parent(hostname.data() + first_dot + 1,
                                               hostname.size() - first_dot - 1);
-                accepted = X509_check_host(x509, parent.data(), parent.size(),
-                                           hostname_check_flags, nullptr) == 1;
+                accepted = certificate_names_host(x509, parent);
             }
         }
         std::string der;
