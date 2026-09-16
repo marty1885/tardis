@@ -1,6 +1,8 @@
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpTypes.h>
 #include <drogon/drogon.h>
+#include <archive.h>
+#include <archive_entry.h>
 #include <sodium.h>
 #include <dremini/GeminiServer.hpp>
 
@@ -326,6 +328,13 @@ struct Paging {
     tardis::SinceCursor cursor;
 };
 
+struct BatchPaging {
+    Paging paging;
+    tardis::SinceCursor first;
+    tardis::SinceCursor last;
+    std::vector<std::string> mime_types;
+};
+
 std::optional<Paging> parse_token(std::string_view token) {
     // p3.<since>.<till>.<mode>.<mime-filter-id>.<committed>.<result-id>
     std::array<std::string_view, 7> parts;
@@ -379,6 +388,142 @@ std::string token_for(std::int64_t since, std::int64_t till, std::string_view na
            std::string(filter_id) + "." +
            std::to_string(result.committed_at_unix_millis) + "." +
            std::to_string(result.crawl_result_id);
+}
+
+std::string hex_encode(std::string_view value) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string encoded;
+    encoded.reserve(value.size() * 2);
+    for (const auto character : value) {
+        const auto byte = static_cast<unsigned char>(character);
+        encoded.push_back(digits[byte >> 4]);
+        encoded.push_back(digits[byte & 0x0f]);
+    }
+    return encoded;
+}
+
+std::optional<std::string> hex_decode(std::string_view value) {
+    if (value.size() % 2 != 0) return std::nullopt;
+    const auto nibble = [](char character) -> std::optional<unsigned char> {
+        if (character >= '0' && character <= '9') return character - '0';
+        if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+        if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+        return std::nullopt;
+    };
+    std::string decoded;
+    decoded.reserve(value.size() / 2);
+    for (std::size_t index = 0; index < value.size(); index += 2) {
+        const auto high = nibble(value[index]);
+        const auto low = nibble(value[index + 1]);
+        if (!high || !low) return std::nullopt;
+        decoded.push_back(static_cast<char>((*high << 4) | *low));
+    }
+    return decoded;
+}
+
+std::string batch_token_for(std::int64_t since, std::int64_t till, std::string_view name,
+                            std::string_view filter_id, const std::vector<std::string>& mime_types,
+                            tardis::SinceCursor first, tardis::SinceCursor last) {
+    std::string filters;
+    for (const auto& mime : mime_types) {
+        if (!filters.empty()) filters.push_back(',');
+        filters += mime;
+    }
+    return "b1." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
+           std::string(filter_id) + "." + (filters.empty() ? "-" : hex_encode(filters)) + "." +
+           std::to_string(first.committed_at_unix_millis) + "." + std::to_string(first.crawl_result_id) + "." +
+           std::to_string(last.committed_at_unix_millis) + "." + std::to_string(last.crawl_result_id);
+}
+
+std::optional<BatchPaging> parse_batch_token(std::string_view token) {
+    // b1.<since>.<till>.<mode>.<mime-filter-id>.<mime-filters-hex|->.<first-committed>.<first-id>.<last-committed>.<last-id>
+    std::array<std::string_view, 10> parts;
+    for (auto& part : parts) {
+        const auto dot = token.find('.');
+        part = token.substr(0, dot);
+        if (dot == std::string_view::npos) token = {};
+        else token.remove_prefix(dot + 1);
+    }
+    if (!token.empty() || parts[0] != "b1" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
+    const auto since = integer(parts[1]);
+    const auto till = integer(parts[2]);
+    const auto first_committed = integer(parts[6]);
+    const auto first_id = integer(parts[7]);
+    const auto last_committed = integer(parts[8]);
+    const auto last_id = integer(parts[9]);
+    if (!since || !till || *till < *since || !first_committed || !first_id || !last_committed || !last_id ||
+        *first_id < 0 || *last_id <= 0 || *first_committed < *since || *last_committed < *first_committed ||
+        *last_committed > *till ||
+        (*last_committed == *first_committed && *last_id <= *first_id))
+        return std::nullopt;
+    std::vector<std::string> filters;
+    if (parts[5] != "-") {
+        const auto decoded = hex_decode(parts[5]);
+        if (!decoded) return std::nullopt;
+        const auto parsed = mime_filters(*decoded);
+        if (!parsed || mime_filter_id(*parsed) != parts[4]) return std::nullopt;
+        filters = *parsed;
+    } else if (mime_filter_id(filters) != parts[4]) {
+        return std::nullopt;
+    }
+    return BatchPaging{{*since, *till, std::string(parts[3]), std::string(parts[4]), {}},
+                       {*first_committed, *first_id}, {*last_committed, *last_id}, std::move(filters)};
+}
+
+bool after(const tardis::SinceCursor& left, const tardis::SinceCursor& right) {
+    return left.committed_at_unix_millis > right.committed_at_unix_millis ||
+           (left.committed_at_unix_millis == right.committed_at_unix_millis &&
+            left.crawl_result_id > right.crawl_result_id);
+}
+
+struct ArchiveOutput { std::string bytes; };
+
+int archive_open(struct archive*, void*) { return ARCHIVE_OK; }
+
+la_ssize_t archive_write(struct archive*, void* client_data, const void* data, std::size_t size) {
+    auto& output = static_cast<ArchiveOutput*>(client_data)->bytes;
+    output.append(static_cast<const char*>(data), size);
+    return static_cast<la_ssize_t>(size);
+}
+
+int archive_close(struct archive*, void*) { return ARCHIVE_OK; }
+
+void archive_check(int result, struct archive* writer, std::string_view operation) {
+    if (result != ARCHIVE_OK) {
+        const auto* error = archive_error_string(writer);
+        throw std::runtime_error(std::string(operation) + ": " +
+                                 (error ? error : "unknown libarchive error"));
+    }
+}
+
+void write_warc_resource(struct archive* writer, std::string_view target, std::string_view body,
+                         std::int64_t unix_millis) {
+    archive_entry* entry = archive_entry_new();
+    if (!entry) throw std::runtime_error("cannot allocate WARC entry");
+    try {
+        const std::string target_copy(target);
+        archive_entry_set_pathname(entry, target_copy.c_str());
+        archive_entry_set_filetype(entry, AE_IFREG);
+        archive_entry_set_perm(entry, 0644);
+        archive_entry_set_size(entry, static_cast<la_int64_t>(body.size()));
+        archive_entry_set_mtime(entry, static_cast<time_t>(unix_millis / 1000), 0);
+        archive_check(archive_write_header(writer, entry), writer, "write WARC header");
+        std::size_t written{};
+        while (written < body.size()) {
+            const auto count = archive_write_data(writer, body.data() + written, body.size() - written);
+            if (count <= 0) {
+                const auto* error = archive_error_string(writer);
+                throw std::runtime_error("write WARC body: " +
+                                         std::string(error ? error : "short WARC write"));
+            }
+            written += static_cast<std::size_t>(count);
+        }
+        archive_check(archive_write_finish_entry(writer), writer, "finish WARC entry");
+    } catch (...) {
+        archive_entry_free(entry);
+        throw;
+    }
+    archive_entry_free(entry);
 }
 
 // All authenticated API routes delegate here. Drogon route templates validate
@@ -480,9 +625,6 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 Json::Value items(Json::arrayValue);
                 for (const auto& result : results) {
                     auto item = metadata(result);
-                    if (result.object)
-                        item["body_base64"] = drogon::utils::base64Encode(
-                            read_body(self->objects_, *result.object));
                     items.append(std::move(item));
                 }
                 body["results"] = std::move(items);
@@ -493,9 +635,110 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 else body["resume_token"] = Json::nullValue;
                 if (more) body["next_page_token"] = token_for(since, till, mode_name, filter_id, results.back());
                 else body["next_page_token"] = Json::nullValue;
+                if (!results.empty())
+                    body["batch_token"] = batch_token_for(
+                        since, till, mode_name, filter_id, mime_types, cursor,
+                        {results.back().committed_at_unix_millis, results.back().crawl_result_id});
+                else body["batch_token"] = Json::nullValue;
                 reply(json_response(std::move(body)));
             } catch (const std::exception& error) {
                 std::cerr << "tardis: API updates request failed: " << error.what() << '\n';
+                reply(error_response(drogon::k500InternalServerError, "internal error"));
+            }
+        });
+    }
+
+    void batch(const drogon::HttpRequestPtr& request,
+               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+               std::string token) {
+        auto self = shared_from_this();
+        drogon::async_run([self, request, reply = std::move(reply), token = std::move(token)]
+                              () mutable -> drogon::Task<void> {
+            try {
+                const auto batch = parse_batch_token(token);
+                if (!batch) {
+                    reply(error_response(drogon::k400BadRequest, "invalid batch token"));
+                    co_return;
+                }
+                const auto use = co_await self->authorize(request, batch->paging.mode, reply);
+                if (!use) co_return;
+
+                auto candidates = co_await self->catalog_.since(
+                    batch->first, batch->paging.till, *use, 1001, batch->mime_types);
+                std::vector<std::pair<CrawlResult, std::string>> records;
+                constexpr std::size_t maximum_body_bytes = 64U * 1024U * 1024U;
+                std::size_t body_bytes{};
+                for (const auto& result : candidates) {
+                    const tardis::SinceCursor result_cursor{
+                        result.committed_at_unix_millis, result.crawl_result_id};
+                    if (after(result_cursor, batch->last)) break;
+                    std::string body;
+                    if (result.object) {
+                        body = read_body(self->objects_, *result.object);
+                        if (!records.empty() && body.size() > maximum_body_bytes - body_bytes)
+                            break;
+                        body_bytes += body.size();
+                    }
+                    records.emplace_back(result, std::move(body));
+                }
+                if (records.empty()) {
+                    reply(error_response(drogon::k404NotFound, "batch is unavailable"));
+                    co_return;
+                }
+                const auto& final = records.back().first;
+                const tardis::SinceCursor final_cursor{
+                    final.committed_at_unix_millis, final.crawl_result_id};
+                const bool has_more = after(batch->last, final_cursor);
+                const auto next = has_more
+                    ? std::optional{batch_token_for(
+                        batch->paging.since, batch->paging.till, batch->paging.mode,
+                        batch->paging.mime_filter, batch->mime_types, final_cursor, batch->last)}
+                    : std::optional<std::string>{};
+
+                Json::Value manifest(Json::objectValue);
+                manifest["format"] = "tardis-warc-batch-1";
+                manifest["mode"] = batch->paging.mode;
+                manifest["batch_token"] = token;
+                if (next) manifest["next_batch_token"] = *next;
+                else manifest["next_batch_token"] = Json::nullValue;
+                Json::Value items(Json::arrayValue);
+                for (const auto& [result, body] : records) {
+                    auto item = metadata(result);
+                    if (result.object) item["warc_target_uri"] = result.crawling_url;
+                    items.append(std::move(item));
+                }
+                manifest["results"] = std::move(items);
+                Json::StreamWriterBuilder json_writer;
+                json_writer["indentation"] = "";
+                const auto manifest_body = Json::writeString(json_writer, manifest);
+
+                ArchiveOutput output;
+                archive* writer = archive_write_new();
+                if (!writer) throw std::runtime_error("cannot allocate WARC writer");
+                try {
+                    archive_check(archive_write_add_filter_zstd(writer), writer, "enable WARC zstd compression");
+                    archive_check(archive_write_set_format_warc(writer), writer, "select WARC format");
+                    archive_check(archive_write_open(writer, &output, archive_open, archive_write, archive_close),
+                                  writer, "open WARC output");
+                    write_warc_resource(writer, "urn:tardis:batch:manifest", manifest_body,
+                                        final.committed_at_unix_millis);
+                    for (const auto& [result, body] : records)
+                        if (result.object)
+                            write_warc_resource(writer, result.crawling_url, body,
+                                                result.committed_at_unix_millis);
+                    archive_check(archive_write_close(writer), writer, "close WARC output");
+                } catch (...) {
+                    archive_write_free(writer);
+                    throw;
+                }
+                archive_write_free(writer);
+                auto response = drogon::HttpResponse::newHttpResponse();
+                response->setContentTypeString("application/warc; compression=zstd");
+                response->setBody(std::move(output.bytes));
+                response->addHeader("Cache-Control", "private, no-store");
+                reply(response);
+            } catch (const std::exception& error) {
+                std::cerr << "tardis: API batch request failed: " << error.what() << '\n';
                 reply(error_response(drogon::k500InternalServerError, "internal error"));
             }
         });
@@ -852,6 +1095,13 @@ int main(int argc, char** argv) {
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
                           const std::string& mode_name, std::int64_t since, std::int64_t till) {
                 api_updates(request, std::move(reply), mode_name, since, till);
+            }, {drogon::Get});
+        drogon::app().registerHandler(
+            "/api/v1/batch/{token}",
+            [api_service](const drogon::HttpRequestPtr& request,
+                          std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+                          const std::string& token) {
+                api_service->batch(request, std::move(reply), token);
             }, {drogon::Get});
         drogon::app().registerHandler(
             "/api/v1/known-feeds/{mode}",

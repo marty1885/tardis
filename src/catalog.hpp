@@ -266,7 +266,9 @@ class Catalog {
                                                      std::int64_t crawl_result_id, Use use);
 
     // Oldest first within (after, through], with an exclusive stable cursor
-    // suitable for resumption.
+    // suitable for resumption.  Repeated captures whose status, metadata,
+    // redirect state, and body are unchanged from this use's prior eligible
+    // capture are omitted; archive history retains every capture.
     drogon::Task<std::vector<CrawlResult>> since(SinceCursor after,
                                                  std::int64_t through_unix_millis, Use use,
                                                  std::size_t limit = 1000,

@@ -83,7 +83,7 @@ int main() {
         assert(second_page.size() == 1 && second_page[0].crawl_result_id == 1);
 
         const auto feed = drogon::sync_wait(catalog.since({1100, 1}, 1500, tardis::Use::archiver));
-        assert(feed.size() == 1 && feed[0].crawl_result_id == 3);
+        assert(feed.empty());  // Capture 3 is the same eligible representation as capture 1.
         const auto bounded_feed = drogon::sync_wait(catalog.since(
             {0, 0}, 1400, tardis::Use::archiver));
         assert(bounded_feed.size() == 1 && bounded_feed[0].crawl_result_id == 1);
@@ -92,6 +92,10 @@ int main() {
         assert(filtered.size() == 1 && filtered[0].crawl_result_id == 2);
         assert(filtered[0].redirected_to &&
                *filtered[0].redirected_to == "gemini://example.org/next");
+
+        const auto changed_feed = drogon::sync_wait(catalog.since(
+            {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver));
+        assert(changed_feed.empty());
 
         tardis::Hash256 object_hash;
         object_hash.fill(std::byte{3});
@@ -116,6 +120,9 @@ int main() {
         };
         const auto appended_id = drogon::sync_wait(catalog.append(std::move(next)));
         assert(appended_id == 4);
+        const auto update_after_change = drogon::sync_wait(catalog.since(
+            {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver));
+        assert(update_after_change.size() == 1 && update_after_change[0].crawl_result_id == 4);
         const auto with_appended =
             drogon::sync_wait(catalog.archive("gemini://example.org/", tardis::Use::archiver));
         assert(with_appended.size() == 3);

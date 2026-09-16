@@ -252,9 +252,9 @@ void HomeController::doc_api(const drogon::HttpRequestPtr&,
     reply(gemini_document(
 R"gemini(# TARDIS API
 
-TARDIS provides a Gemini API for archive retrieval and incremental index updates.
+TARDIS provides a Gemini API for archive retrieval and page-change feeds.
 
-Archive retrieval, incremental updates, and mode-specific feed listings are available only over Gemini with a client certificate. A client certificate is authorized by its SHA-256 fingerprint and the virtual crawler modes assigned to it. No certificate returns 60; an unrecognized, revoked, or mode-denied certificate returns 61. HTTP requests cannot carry this Gemini certificate and therefore return 403 on those protected routes. The public /api/v1/known_feeds route is also available over HTTP.
+Archive retrieval, page-change feeds, and mode-specific feed listings are available only over Gemini with a client certificate. A client certificate is authorized by its SHA-256 fingerprint and the virtual crawler modes assigned to it. No certificate returns 60; an unrecognized, revoked, or mode-denied certificate returns 61. HTTP requests cannot carry this Gemini certificate and therefore return 403 on those protected routes.
 
 There is currently no self served API sign up. Please send an message along with your client certificate's SHA-256 fingerprint to the author for access to the non-public endpoints:
 
@@ -312,13 +312,15 @@ Mode is one of one of the following. URL components are percent-encoded path par
 * tlgs
 * webproxy
 
-### Incremental updates
+### Page changes
 
-```format for incremental updates
+```format for page changes
 /api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}[/mime/{mime_types}][/page/{paging_token}][/limit/{page_size}]
 ```
 
-This returns JSON crawl-result events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged update run stable while new crawl results arrive. It is designed for search engines to update an index without recrawling Gemini. Results contain metadata, URLs, and body_base64 whenever an archived body exists. Limit defaults to 100 and accepts 1 through 1000.
+This returns JSON page-change events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged change run stable while new crawl results arrive. It is designed for search engines to learn which pages need reindexing without downloading every crawl. A page is emitted for its first eligible capture and thereafter only when its status, metadata, redirect state, or body changes; unchanged recrawls remain in archive history but are omitted. Results contain metadata, URLs, and the body digest and size, never body bytes. Limit defaults to 100 and accepts 1 through 1000.
+
+Use the body digest to avoid fetching a representation already held by the client. A changed body can be fetched through the batch-fetch endpoint below.
 
 The optional mime_types segment is a percent-encoded comma-separated list of MIME types. It filters body results before paging, so a text-only indexer does not download PDF bodies it will not index. Redirect results with a resolved target are always included so an indexer can update URL mappings. These events include status_code, url, and redirected_to, even when the target page was crawled earlier.
 
@@ -330,7 +332,7 @@ Example MIME filter:
 
 Example response:
 
-```Example response of incremental update
+```Example response of page changes
 {
   "mode": "archive",
   "since_unix_millis": 1767225600000,
@@ -344,10 +346,10 @@ Example response:
     "status_code": 20,
     "meta": "text/gemini; charset=utf-8",
     "body_bytes": 1234,
-    "body_blake2b_256": "...",
-    "body_base64": "SGVsbG8sIEdlbWluaSEK"
+    "body_blake2b_256": "..."
   }],
   "has_more": true,
+  "batch_token": "b1.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225600000.0.1767225700456.42",
   "next_page_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42",
   "resume_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42"
 }
@@ -356,6 +358,20 @@ Example response:
 You can follow next_page_token while has_more is true. Persist resume_token only after processing a page; send it in /page/ on the next poll. Paging tokens are bound to the original mode, since timestamp, and till timestamp.
 
 Invalid parameters or tokens return 59.
+
+### Batch fetch
+
+Each non-empty page-change response includes a batch_token. Fetch it over the same authenticated Gemini connection identity:
+
+```format for batch fetch
+/api/v1/batch/{batch_token}
+```
+
+The response is always a zstd-compressed WARC/1.0 stream with MIME type application/warc; compression=zstd. It contains a JSON manifest resource at urn:tardis:batch:manifest followed by one WARC resource record for each changed capture that has an archived body. The manifest lists every change in the batch, including redirects and failures that have no body, and maps its body metadata to the corresponding WARC target URI.
+
+The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME filter, and exact page of changes, so a batch never contains unrelated captures.
+
+The WARC record payload is the original raw body bytes. There is no Base64 encoding. A client must zstd-decompress the response before passing it to a WARC reader.
 
 )gemini"));
 }
@@ -380,7 +396,7 @@ drogon::Task<drogon::HttpResponsePtr> HomeController::certificate_change(
     if (!catalog_) throw std::logic_error("HomeController is not configured");
     const auto changes = co_await catalog_->certificate_changes();
     if (changes.empty())
-        co_return gemini_document("# Certificate changes\n\nNo certificate changes have been detected.\n");
+        co_return gemini_document("# Certificate changes\n\nNo certificate changes have been detected since the beginning of TARDIS' operation.\n");
 
     std::string body = "# Certificate changes\n";
     std::string year;

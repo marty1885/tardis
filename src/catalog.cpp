@@ -300,6 +300,9 @@ void Catalog::open(bool recover_claims) {
         R"sql(CREATE INDEX IF NOT EXISTS crawl_results_by_page
             ON crawl_results(page_id, started_at_unix_millis DESC,
                              crawl_result_id DESC))sql",
+        R"sql(CREATE INDEX IF NOT EXISTS crawl_results_by_page_commit
+            ON crawl_results(page_id, committed_at_unix_millis DESC,
+                             crawl_result_id DESC))sql",
         R"sql(CREATE INDEX IF NOT EXISTS crawl_results_since
             ON crawl_results(committed_at_unix_millis, crawl_result_id,
                              robots_bitfield))sql",
@@ -559,6 +562,30 @@ WHERE (cr.committed_at_unix_millis > ? OR
        (cr.committed_at_unix_millis = ? AND cr.crawl_result_id > ?))
   AND (cr.robots_bitfield & ?) != 0
   AND cr.committed_at_unix_millis <= ?
+  -- A crawl is historical even when it found the same representation, but
+  -- search clients only need the first eligible capture and subsequent
+  -- changes.  Compare against this use's previous eligible capture: a page
+  -- that becomes visible to a new use must still be announced.
+  AND NOT EXISTS (
+      SELECT 1
+      FROM crawl_results AS previous
+      WHERE previous.crawl_result_id = (
+          SELECT earlier.crawl_result_id
+          FROM crawl_results AS earlier
+          WHERE earlier.page_id = cr.page_id
+            AND (earlier.robots_bitfield & ?) != 0
+            AND (earlier.committed_at_unix_millis < cr.committed_at_unix_millis OR
+                 (earlier.committed_at_unix_millis = cr.committed_at_unix_millis AND
+                  earlier.crawl_result_id < cr.crawl_result_id))
+          ORDER BY earlier.committed_at_unix_millis DESC, earlier.crawl_result_id DESC
+          LIMIT 1
+      )
+        AND previous.status_code IS cr.status_code
+        AND previous.redirected_to_page_id IS cr.redirected_to_page_id
+        AND previous.redirect_count = cr.redirect_count
+        AND previous.object_id IS cr.object_id
+        AND previous.meta IS cr.meta
+  )
 )sql";
     if (!mime_types.empty()) {
         sql += " AND ((cr.status_code BETWEEN 30 AND 39 AND "
@@ -576,7 +603,7 @@ ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
     const auto rows = co_await reader_->execSqlCoro(
         sql, after.committed_at_unix_millis, after.committed_at_unix_millis, after.crawl_result_id,
-        use_bit(use), through_unix_millis, static_cast<std::int64_t>(limit));
+        use_bit(use), through_unix_millis, use_bit(use), static_cast<std::int64_t>(limit));
     std::vector<CrawlResult> results;
     results.reserve(rows.size());
     for (const auto& row : rows) results.push_back(decode_result(row));
