@@ -371,7 +371,7 @@ The response is always a zstd-compressed WARC/1.0 stream with MIME type applicat
 
 The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME filter, and exact page of changes, so a batch never contains unrelated captures.
 
-The WARC record payload is the original raw body bytes. There is no Base64 encoding. A client must zstd-decompress the response before passing it to a WARC reader.
+The WARC record payload is the original raw body bytes. A client must zstd-decompress the response before passing it to a WARC reader.
 
 )gemini"));
 }
