@@ -127,17 +127,17 @@ _______(_@_)_______
 
 💂 TARDIS, the unified crawler and archiver for the Small Web - so you don't have to.
 
-=> 🔍 /archive/url Browse an archived URL
-=> 📜 /archive/history/url Browse an archived URL's history
+=> /archive/url 🔍 Browse an archived URL
+=> /archive/history/url 📜 Browse an archived URL's history
 
-=> 📃 /certificate_change Detected certificate changes
-=> 🔏 /known_security_txt Known security.txt files
-=> 📰 /known_feeds Known feeds
-=> 🌱 /add_seed Missing your capsule? Add it to TARDIS
+=> /certificate_change 📃 Detected certificate changes
+=> /known_security_txt 🔏 Known security.txt files
+=> /known_feeds 📰 Known feeds
+=> /add_seed 🌱 Missing your capsule? Add it to TARDIS
 
-=> 📖 /about About TARDIS
-=> 📖 /docs/api API documentation
-=> 📊 /statistics Archive statistics
+=> /about 📖 About TARDIS
+=> /docs/api 📖 API documentation
+=> /statistics 📊 Archive statistics
 )gemini"));
 }
 
