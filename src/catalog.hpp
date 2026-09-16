@@ -241,6 +241,10 @@ class Catalog {
     // maintenance, WAL setup, and claim recovery are crawler-owner work.
     void open(bool recover_claims = true);
 
+    // Opens a writer for small, externally submitted queue updates. The
+    // crawler must have already initialized the snapshot schema.
+    void open_for_submission();
+
     // Newest first. An absent cursor starts at the newest eligible capture.
     drogon::Task<std::vector<CrawlResult>> archive(
         std::string_view canonical_url, Use use = Use::archiver,
@@ -287,6 +291,11 @@ class Catalog {
     // this primitive. Duplicate requests are merged in C++, then persisted.
     drogon::Task<void> enqueue(PageAddress page, QueueReason reason,
                                std::int64_t ready_at_unix_millis);
+
+    // Queues a submitted seed only when it has never produced a crawl result.
+    // Returns false when the canonical page is already crawled.
+    drogon::Task<bool> enqueue_seed_if_uncrawled(PageAddress page,
+                                                 std::int64_t ready_at_unix_millis);
 
     // Claim one ready page and reserve its host's politeness window in the
     // same transaction. Authorities in busy_authorities are already in

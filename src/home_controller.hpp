@@ -16,6 +16,7 @@ class HomeController : public drogon::HttpController<HomeController> {
     ADD_METHOD_TO(HomeController::certificate_change, "/certificate_change", drogon::Get);
     ADD_METHOD_TO(HomeController::known_security_txt, "/known_security_txt", drogon::Get);
     ADD_METHOD_TO(HomeController::known_feeds, "/known_feeds", drogon::Get);
+    ADD_METHOD_TO(HomeController::add_seed, "/add_seed", drogon::Get);
     ADD_METHOD_TO(HomeController::known_feeds_json, "/api/v1/known_feeds", drogon::Get);
     ADD_METHOD_TO(HomeController::about, "/about", drogon::Get);
     ADD_METHOD_TO(HomeController::doc_api, "/docs/api", drogon::Get);
@@ -34,6 +35,7 @@ class HomeController : public drogon::HttpController<HomeController> {
     drogon::Task<drogon::HttpResponsePtr> certificate_change(drogon::HttpRequestPtr request);
     drogon::Task<drogon::HttpResponsePtr> known_security_txt(drogon::HttpRequestPtr request);
     drogon::Task<drogon::HttpResponsePtr> known_feeds(drogon::HttpRequestPtr request);
+    drogon::Task<drogon::HttpResponsePtr> add_seed(drogon::HttpRequestPtr request);
     drogon::Task<drogon::HttpResponsePtr> known_feeds_json(drogon::HttpRequestPtr request);
     void about(const drogon::HttpRequestPtr& request,
                     std::function<void(const drogon::HttpResponsePtr&)>&& reply);

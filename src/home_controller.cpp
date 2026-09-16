@@ -5,6 +5,7 @@
 #include <drogon/drogon.h>
 
 #include <array>
+#include <chrono>
 #include <ctime>
 #include <stdexcept>
 #include <string>
@@ -74,6 +75,24 @@ std::string short_fingerprint(std::string_view fingerprint) {
     return std::string(fingerprint.substr(0, std::min<std::size_t>(16, fingerprint.size())));
 }
 
+std::optional<tardis::PageAddress> seed_address(std::string_view input) {
+    if (input.size() > 2048 || input.find_first_of("\r\n\0") != std::string_view::npos)
+        return std::nullopt;
+    tlgs::Url url{std::string(input)};
+    if (!url.good() || url.protocol() != "gemini" || url.host().empty() ||
+        url.host().front() == '.' || url.host().back() == '.')
+        return std::nullopt;
+    url.withFragment("");
+    tardis::redirect_internal_url(url);
+    return tardis::PageAddress{url.str(), url.hostWithPort(1965)};
+}
+
+std::int64_t unix_millis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
 }  // namespace
 
 void HomeController::configure(tardis::Catalog& catalog) {
@@ -108,16 +127,17 @@ _______(_@_)_______
 
 💂 TARDIS, the unified crawler and archiver for the Small Web - so you don't have to.
 
-=> /archive/url Browse an archived URL
-=> /archive/history/url Browse an archived URL's history
+=> 🔍 /archive/url Browse an archived URL
+=> 📜 /archive/history/url Browse an archived URL's history
 
-=> /certificate_change Detected certificate changes
-=> /known_security_txt Known security.txt files
-=> /known_feeds Known feeds
+=> 📃 /certificate_change Detected certificate changes
+=> 🔏 /known_security_txt Known security.txt files
+=> 📰 /known_feeds Known feeds
+=> 🌱 /add_seed Missing your capsule? Add it to TARDIS
 
-=> /about About TARDIS
-=> /docs/api API documentation
-=> /statistics Archive statistics
+=> 📖 /about About TARDIS
+=> 📖 /docs/api API documentation
+=> 📊 /statistics Archive statistics
 )gemini"));
 }
 
@@ -404,10 +424,10 @@ drogon::Task<drogon::HttpResponsePtr> HomeController::known_feeds(
             "\n"
             "Feeds that is known to TARDIS across the Small Web. Please select a supported feed type.\n"
             "\n"
-            "=> /known_feeds?atom Atom\n"
-            "=> /known_feeds?gemsub Gemsub\n"
-            "=> /known_feeds?twtxt TWTXT\n"
-            "=> /known_feeds?rss RSS\n");
+            "=> /known_feeds?atom ⚛ Atom\n"
+            "=> /known_feeds?gemsub ♊ Gemsub\n"
+            "=> /known_feeds?twtxt 🐦 TWTXT\n"
+            "=> /known_feeds?rss 🛜 RSS\n");
     }
     if (type != "atom" && type != "gemsub" && type != "rss" && type != "twtxt")
         co_return gemini_error(request, 59, "Unsupported feed type");
@@ -422,6 +442,19 @@ drogon::Task<drogon::HttpResponsePtr> HomeController::known_feeds(
         body += "> Nope! Nothing here yet";
     }
     co_return gemini_document(std::move(body));
+}
+
+drogon::Task<drogon::HttpResponsePtr> HomeController::add_seed(
+    drogon::HttpRequestPtr request) {
+    if (!catalog_) throw std::logic_error("HomeController is not configured");
+    const auto input = drogon::utils::urlDecode(request->getParameter("query"));
+    if (input.empty())
+        co_return gemini_error(request, 10, "Enter a Gemini URL");
+    const auto page = seed_address(input);
+    if (!page)
+        co_return gemini_error(request, 59, "Enter a well-formed Gemini URL");
+    co_await catalog_->enqueue_seed_if_uncrawled(*page, unix_millis());
+    co_return gemini_document("# Seed submitted\n\n" + page->url + " has been added to the crawl queue.\n");
 }
 
 drogon::Task<drogon::HttpResponsePtr> HomeController::known_feeds_json(
@@ -455,4 +488,5 @@ User-agent: *
 Disallow: /api
 Disallow: /archive
 )");
+    co_return resp;
 }

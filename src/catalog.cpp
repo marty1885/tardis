@@ -492,6 +492,19 @@ void Catalog::open(bool recover_claims) {
         "WHERE crawl_queue.host_id=hosts.host_id AND state_code=0)");
 }
 
+void Catalog::open_for_submission() {
+    const auto database = snapshot_dir_ / "catalog.sqlite3";
+    const auto connection = "filename=" + database.string();
+    reader_ = drogon::orm::DbClient::newSqlite3Client(connection, read_connections_);
+    writer_ = drogon::orm::DbClient::newSqlite3Client(connection, 1);
+    writer_->execSqlSync("PRAGMA foreign_keys=ON");
+    writer_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
+    writer_->execSqlSync("PRAGMA temp_store=MEMORY");
+    reader_->execSqlSync("PRAGMA foreign_keys=ON");
+    reader_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
+    reader_->execSqlSync("PRAGMA temp_store=MEMORY");
+}
+
 drogon::Task<std::vector<CrawlResult>> Catalog::archive(std::string_view canonical_url, Use use,
                                                         std::optional<ArchiveCursor> before,
                                                         std::size_t limit) {
@@ -941,6 +954,53 @@ drogon::Task<void> Catalog::enqueue(PageAddress page, QueueReason reason,
             merge_queue_request(existing, page_id, host_id, reason, ready_at_unix_millis);
         co_await write_queue_entry(transaction, merged);
         co_await refresh_host_queue_time(transaction, host_id);
+    } catch (...) {
+        transaction->rollback();
+        throw;
+    }
+}
+
+drogon::Task<bool> Catalog::enqueue_seed_if_uncrawled(
+    PageAddress page, std::int64_t ready_at_unix_millis) {
+    if (!writer_)
+        throw std::logic_error("catalog is not open for submissions");
+    if (page.url.empty() || page.authority.empty())
+        throw std::invalid_argument("submitted seed requires a URL and authority");
+    auto transaction =
+        co_await writer_->newTransactionCoro(drogon::orm::TransactionType::Immediate);
+    try {
+        co_await transaction->execSqlCoro("INSERT OR IGNORE INTO hosts(authority) VALUES(?)",
+                                          page.authority);
+        co_await transaction->execSqlCoro(
+            "INSERT OR IGNORE INTO pages(url,host_id,first_seen_unix_millis) "
+            "SELECT ?,host_id,CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "FROM hosts WHERE authority=?",
+            page.url, page.authority);
+        const auto page_rows = co_await transaction->execSqlCoro(
+            "SELECT page_id,host_id,latest_crawl_result_id FROM pages WHERE url=?", page.url);
+        if (page_rows.empty())
+            throw std::runtime_error("failed to intern submitted seed");
+        if (!page_rows[0]["latest_crawl_result_id"].isNull()) {
+            transaction->rollback();
+            co_return false;
+        }
+        const auto page_id = page_rows[0]["page_id"].as<std::int64_t>();
+        const auto host_id = page_rows[0]["host_id"].as<std::int64_t>();
+        const auto queue_rows = co_await transaction->execSqlCoro(
+            "SELECT page_id AS queue_page_id,host_id AS queue_host_id,"
+            "state_code AS queue_state_code,reason_bitfield AS queue_reason_bitfield,"
+            "ready_at_unix_millis AS queue_ready_at_unix_millis,"
+            "claimed_at_unix_millis AS queue_claimed_at_unix_millis,"
+            "attempt_count AS queue_attempt_count FROM crawl_queue WHERE page_id=?",
+            page_id);
+        std::optional<QueueEntry> existing;
+        if (!queue_rows.empty())
+            existing = decode_queue_entry(queue_rows[0]);
+        const auto merged = merge_queue_request(existing, page_id, host_id,
+                                                QueueReason::submitted, ready_at_unix_millis);
+        co_await write_queue_entry(transaction, merged);
+        co_await refresh_host_queue_time(transaction, host_id);
+        co_return true;
     } catch (...) {
         transaction->rollback();
         throw;

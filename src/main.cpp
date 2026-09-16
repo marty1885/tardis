@@ -743,9 +743,8 @@ int main(int argc, char** argv) {
             !std::filesystem::is_regular_file(cert_file) ||
             !std::filesystem::is_regular_file(key_file))
             throw std::invalid_argument("--cert and --key must name files");
-        // Catalog::open(false) creates no writer client.
         tardis::Catalog catalog(archive, 1, 5000);
-        catalog.open(false);
+        catalog.open_for_submission();
         tardis::ObjectStore objects(archive, false);
         HomeController::configure(catalog);
         drogon::app().setThreadNum(4);
@@ -988,9 +987,9 @@ int main(int argc, char** argv) {
         tardis::sandbox::Policy sandbox_policy;
         sandbox_policy.read_only = {
             "/etc/hosts", "/etc/host.conf", "/etc/nsswitch.conf", "/etc/resolv.conf",
-            "/etc/gai.conf", std::filesystem::absolute(archive),
-            std::filesystem::absolute(clients_db).parent_path(), std::filesystem::absolute(cert_file),
+            "/etc/gai.conf", std::filesystem::absolute(clients_db).parent_path(), std::filesystem::absolute(cert_file),
             std::filesystem::absolute(key_file)};
+        sandbox_policy.read_write = {std::filesystem::absolute(archive)};
         tardis::sandbox::run_after_initialization(
             [server, sandbox_policy = std::move(sandbox_policy)]() mutable -> drogon::Task<void> {
                 try {

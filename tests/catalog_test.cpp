@@ -6,6 +6,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -146,6 +147,10 @@ int main() {
         assert(changes[0].authority == "example.org");
         assert(changes[0].previous_certificate_blake2b_256 == std::string(64, '0'));
         assert(changes[0].observed_at_unix_millis == 1610);
+
+        // The initial fixture page already has crawl history, so it is not requeued.
+        assert(!drogon::sync_wait(catalog.enqueue_seed_if_uncrawled(
+            {"gemini://example.org/", "example.org"}, 1500)));
 
         const tardis::PageAddress watched_page{"gemini://example.org/watch", "example.org"};
         drogon::sync_wait(catalog.watch(watched_page, 2000));
@@ -358,6 +363,12 @@ int main() {
         recovered.open();
         const auto recovered_stats = drogon::sync_wait(recovered.stats());
         assert(recovered_stats.claimed == 0 && recovered_stats.queued == 1);
+        const tardis::PageAddress seed_page{"gemini://example.org/seed", "example.org"};
+        assert(drogon::sync_wait(recovered.enqueue_seed_if_uncrawled(
+            seed_page, std::numeric_limits<std::int64_t>::max())));
+        // Repeating an uncrawled submission reuses its one pending queue row.
+        assert(drogon::sync_wait(recovered.enqueue_seed_if_uncrawled(
+            seed_page, std::numeric_limits<std::int64_t>::max())));
     }
     std::filesystem::remove_all(snapshot);
 }
