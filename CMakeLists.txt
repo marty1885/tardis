@@ -7,16 +7,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Drogon REQUIRED)
 find_package(SQLite3 REQUIRED)
-# ROOT documents find_package(ROOT COMPONENTS ...), but this host's packaged
-# ROOTConfig.cmake is malformed (and cannot be probed safely by CMake). Use
-# ROOT's supported root-config interface until that system package is repaired.
-find_program(ROOT_CONFIG_EXECUTABLE root-config REQUIRED)
-execute_process(COMMAND ${ROOT_CONFIG_EXECUTABLE} --cflags
-                OUTPUT_VARIABLE ROOT_CFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-execute_process(COMMAND ${ROOT_CONFIG_EXECUTABLE} --libs
-                OUTPUT_VARIABLE ROOT_LDFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
-separate_arguments(ROOT_CFLAGS NATIVE_COMMAND "${ROOT_CFLAGS}")
-separate_arguments(ROOT_LDFLAGS NATIVE_COMMAND "${ROOT_LDFLAGS}")
 find_library(TARDIS_SQLITE3_LIBRARY NAMES sqlite3 REQUIRED)
 find_library(ZSTD_LIBRARY zstd REQUIRED)
 find_library(SODIUM_LIBRARY sodium REQUIRED)
@@ -95,27 +85,23 @@ target_link_libraries(tardis_sandbox PUBLIC tardis_minijail ${SECCOMP_LIBRARY})
 set_target_properties(tardis_sandbox PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
 
 add_executable(tardis src/main.cpp src/home_controller.cpp src/archive_link_rewrite.cpp
-                    src/root_body_store.cpp)
+                    src/object_store.cpp)
 target_include_directories(tardis PRIVATE src)
 target_link_libraries(tardis PRIVATE tardis_catalog tardis_api_clients dremini tlgs_url
                                          tardis_sandbox Drogon::Drogon ${TARDIS_SQLITE3_LIBRARY}
-                                         ${SODIUM_LIBRARY})
-target_compile_options(tardis PRIVATE ${ROOT_CFLAGS})
-target_link_options(tardis PRIVATE ${ROOT_LDFLAGS}
-                    "LINKER:--wrap=landlock_create_ruleset"
+                                         ${SODIUM_LIBRARY} ${ZSTD_LIBRARY})
+target_link_options(tardis PRIVATE "LINKER:--wrap=landlock_create_ruleset"
                     "LINKER:--wrap=landlock_restrict_self")
 
 add_executable(tardis-crawler src/crawler_main.cpp src/crawler.cpp src/exclusion.cpp
                               src/sqlite_step_profile.cpp
-                              src/root_body_store.cpp src/ssrf.cpp)
+                              src/object_store.cpp src/ssrf.cpp)
 target_include_directories(tardis-crawler PRIVATE src ${SQLite3_INCLUDE_DIRS})
 target_link_libraries(tardis-crawler PRIVATE dremini tlgs_url Drogon::Drogon
                                              tardis_catalog tardis_sandbox ${SQLite3_LIBRARIES} ${ZSTD_LIBRARY}
                                              ${SODIUM_LIBRARY}
                                              OpenSSL::Crypto pugixml::pugixml ${CMAKE_DL_LIBS})
-target_compile_options(tardis-crawler PRIVATE ${ROOT_CFLAGS})
-target_link_options(tardis-crawler PRIVATE ${ROOT_LDFLAGS}
-                    "LINKER:--wrap=landlock_create_ruleset"
+target_link_options(tardis-crawler PRIVATE "LINKER:--wrap=landlock_create_ruleset"
                     "LINKER:--wrap=landlock_restrict_self")
 
 include(CTest)
@@ -126,12 +112,10 @@ if(BUILD_TESTING)
 
   add_executable(tardis_unit tests/unit.cpp src/crawler.cpp src/exclusion.cpp
                             src/archive_link_rewrite.cpp
-                            src/root_body_store.cpp src/ssrf.cpp)
+                            src/object_store.cpp src/ssrf.cpp)
   target_include_directories(tardis_unit PRIVATE src ${SQLite3_INCLUDE_DIRS})
   target_link_libraries(tardis_unit PRIVATE dremini tlgs_url Drogon::Drogon ${SQLite3_LIBRARIES}
                                            tardis_catalog ${ZSTD_LIBRARY} ${SODIUM_LIBRARY}
                                            OpenSSL::Crypto pugixml::pugixml ${CMAKE_DL_LIBS})
-  target_compile_options(tardis_unit PRIVATE ${ROOT_CFLAGS})
-  target_link_options(tardis_unit PRIVATE ${ROOT_LDFLAGS})
   add_test(NAME tardis_unit COMMAND tardis_unit)
 endif()

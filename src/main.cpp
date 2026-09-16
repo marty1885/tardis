@@ -1,5 +1,3 @@
-#include <TFile.h>
-#include <TTree.h>
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpTypes.h>
 #include <drogon/drogon.h>
@@ -15,7 +13,6 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -30,7 +27,7 @@
 #include "home_controller.hpp"
 #include "media_type.hpp"
 #include "media_type.hpp"
-#include "root_body_store.hpp"
+#include "object_store.hpp"
 #include "sandbox.hpp"
 #include "tlgs_url_parser.hpp"
 
@@ -209,38 +206,23 @@ drogon::HttpResponsePtr archive_history_response(
     return response;
 }
 
-std::string read_body(const std::filesystem::path& snapshot, const tardis::Object& object) {
-    static std::mutex root_mutex;
-    std::lock_guard lock(root_mutex);
-    const std::filesystem::path relative(object.root_shard_path);
-    if (relative.is_absolute() || relative.lexically_normal().string().starts_with(".."))
-        throw std::runtime_error("invalid body shard path");
-    const auto full = snapshot / relative;
-    std::unique_ptr<TFile> file(TFile::Open(full.c_str(), "READ"));
-    if (!file || file->IsZombie()) throw std::runtime_error("cannot read archived body shard");
-    auto* tree = file->Get<TTree>(object.root_tree_name.c_str());
-    if (!tree || object.root_entry_index < 0 || object.root_entry_index >= tree->GetEntries())
-        throw std::runtime_error("archived body locator is unavailable");
-    std::vector<unsigned char>* body{};
-    if (tree->SetBranchAddress("body", &body) < 0 ||
-        tree->GetEntry(object.root_entry_index) <= 0 || !body)
-        throw std::runtime_error("cannot read archived body");
-    if (static_cast<std::int64_t>(body->size()) != object.raw_bytes)
-        throw std::runtime_error("archived body size disagrees with catalog");
+std::string read_body(const tardis::ObjectStore& objects, const tardis::Object& object) {
+    auto body = objects.get(object.blake2b_256, object.raw_bytes);
     std::array<unsigned char, 32> actual{};
-    if (crypto_generichash_blake2b(actual.data(), actual.size(), body->data(), body->size(),
+    if (crypto_generichash_blake2b(actual.data(), actual.size(),
+                                   reinterpret_cast<const unsigned char*>(body.data()), body.size(),
                                    nullptr, 0) != 0)
         throw std::runtime_error("cannot hash archived body");
     for (std::size_t i = 0; i < actual.size(); ++i)
         if (actual[i] != std::to_integer<unsigned char>(object.blake2b_256[i]))
             throw std::runtime_error("archived body hash disagrees with catalog");
-    return {body->begin(), body->end()};
+    return body;
 }
 
 drogon::HttpResponsePtr archived_response(const drogon::HttpRequestPtr& request,
                                           const CrawlResult& result,
                                           const tardis::ArchiveNeighbors& neighbors,
-                                          const std::filesystem::path& snapshot) {
+                                          const tardis::ObjectStore& objects) {
     const auto original_status = result.status_code.value_or(51);
     const bool gemini = request->getHeader("protocol") == "gemini";
     auto response = drogon::HttpResponse::newHttpResponse();
@@ -254,11 +236,11 @@ drogon::HttpResponsePtr archived_response(const drogon::HttpRequestPtr& request,
                 std::string body = archive_banner(result) + archive_navigation(result, neighbors) + "\n---\n\n";
                 if (result.object)
                     body += tardis::rewrite_archived_gemtext_links(
-                        read_body(snapshot, *result.object), result.crawling_url);
+                        read_body(objects, *result.object), result.crawling_url);
                 response->setBody(std::move(body));
             } else {
                 response->setContentTypeString(mime);
-                if (result.object) response->setBody(read_body(snapshot, *result.object));
+                if (result.object) response->setBody(read_body(objects, *result.object));
             }
         } else if (original_status >= 30 && original_status < 40) {
             response->addHeader("location", result.redirected_to.value_or(
@@ -278,11 +260,11 @@ drogon::HttpResponsePtr archived_response(const drogon::HttpRequestPtr& request,
                 std::string body = archive_banner(result) + archive_navigation(result, neighbors) + "\n---\n\n";
                 if (result.object)
                     body += tardis::rewrite_archived_gemtext_links(
-                        read_body(snapshot, *result.object), result.crawling_url);
+                        read_body(objects, *result.object), result.crawling_url);
                 response->setBody(std::move(body));
             } else {
                 response->setContentTypeString(mime);
-                if (result.object) response->setBody(read_body(snapshot, *result.object));
+                if (result.object) response->setBody(read_body(objects, *result.object));
             }
         } else if (original_status >= 30 && original_status < 40 && result.redirected_to) {
             response->setStatusCode(drogon::k302Found);
@@ -376,8 +358,8 @@ std::string token_for(std::int64_t since, std::string_view name, std::string_vie
 class ApiService : public std::enable_shared_from_this<ApiService> {
    public:
     ApiService(tardis::Catalog& catalog, tardis::ApiClientStore& clients,
-               std::filesystem::path archive)
-        : catalog_(catalog), clients_(clients), archive_(std::move(archive)) {}
+               tardis::ObjectStore& objects)
+        : catalog_(catalog), clients_(clients), objects_(objects) {}
 
     void retrieve(const drogon::HttpRequestPtr& request,
                   std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -410,7 +392,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 auto body = metadata(*result);
                 body["mode"] = mode_name;
                 if (result->object)
-                    body["body_base64"] = drogon::utils::base64Encode(read_body(self->archive_, *result->object));
+                    body["body_base64"] = drogon::utils::base64Encode(read_body(self->objects_, *result->object));
                 if (result->certificate)
                     body["certificate_der_base64"] = drogon::utils::base64Encode(result->certificate->bytes);
                 reply(json_response(std::move(body)));
@@ -465,7 +447,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     auto item = metadata(result);
                     if (result.object)
                         item["body_base64"] = drogon::utils::base64Encode(
-                            read_body(self->archive_, *result.object));
+                            read_body(self->objects_, *result.object));
                     items.append(std::move(item));
                 }
                 body["results"] = std::move(items);
@@ -575,15 +557,15 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
 
     tardis::Catalog& catalog_;
     tardis::ApiClientStore& clients_;
-    std::filesystem::path archive_;
+    tardis::ObjectStore& objects_;
 };
 
 // All public archive routes delegate here. Route templates only bind and type
 // check their path parameters; this object owns target validation and serving.
 class ArchiveService : public std::enable_shared_from_this<ArchiveService> {
    public:
-    ArchiveService(tardis::Catalog& catalog, std::filesystem::path archive)
-        : catalog_(catalog), archive_(std::move(archive)) {}
+    ArchiveService(tardis::Catalog& catalog, tardis::ObjectStore& objects)
+        : catalog_(catalog), objects_(objects) {}
 
     void serve(const drogon::HttpRequestPtr& request,
                std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -623,7 +605,7 @@ class ArchiveService : public std::enable_shared_from_this<ArchiveService> {
                     }
                     const auto neighbors = co_await self->catalog_.archive_neighbors(
                         *url, {result->started_at_unix_millis, result->crawl_result_id}, Use::archiver);
-                    reply(archived_response(request, *result, neighbors, self->archive_));
+                    reply(archived_response(request, *result, neighbors, self->objects_));
                     co_return;
                 }
                 const auto result = co_await self->catalog_.retrieve(
@@ -635,7 +617,7 @@ class ArchiveService : public std::enable_shared_from_this<ArchiveService> {
                 }
                 const auto neighbors = co_await self->catalog_.archive_neighbors(
                     *url, {result->started_at_unix_millis, result->crawl_result_id}, Use::archiver);
-                reply(archived_response(request, *result, neighbors, self->archive_));
+                reply(archived_response(request, *result, neighbors, self->objects_));
             } catch (const std::exception& error) {
                 std::cerr << "tardis: archive request failed: " << error.what() << '\n';
                 reply(error_response(drogon::k500InternalServerError, "internal error"));
@@ -645,7 +627,7 @@ class ArchiveService : public std::enable_shared_from_this<ArchiveService> {
 
    private:
     tardis::Catalog& catalog_;
-    std::filesystem::path archive_;
+    tardis::ObjectStore& objects_;
 };
 
 drogon::HttpResponsePtr certificate_error(const drogon::HttpRequestPtr& request,
@@ -754,6 +736,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("--cert and --key must name files");
         tardis::Catalog catalog(archive, 4, 5000);
         catalog.open(false);
+        tardis::ObjectStore objects(archive, false);
         HomeController::configure(catalog);
         drogon::app().setThreadNum(4);
         drogon::app().addListener(listen, http_port);
@@ -761,8 +744,7 @@ int main(int argc, char** argv) {
         auto server = std::make_shared<dremini::GeminiServer>(
             drogon::app().getLoop(), address, key_file.string(), cert_file.string());
         tardis::sandbox::warm_up_openssl();
-        tardis::warm_up_root_body_store();
-        auto api_service = std::make_shared<ApiService>(catalog, clients, archive);
+        auto api_service = std::make_shared<ApiService>(catalog, clients, objects);
         const auto api_retrieve = [api_service](const drogon::HttpRequestPtr& request,
                                                 std::function<void(const drogon::HttpResponsePtr&)>&& reply,
                                                 const std::string& selector,
@@ -903,7 +885,7 @@ int main(int argc, char** argv) {
                                          token, limit, *filters);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});
-        auto archive_service = std::make_shared<ArchiveService>(catalog, archive);
+        auto archive_service = std::make_shared<ArchiveService>(catalog, objects);
         const auto archive_target = [archive_service](ArchiveSelection selection,
                                                       std::optional<std::int64_t> value,
                                                       const drogon::HttpRequestPtr& request,

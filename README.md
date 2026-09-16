@@ -74,7 +74,8 @@ The crawler performs these operations through `Catalog`:
 - evaluates one cached `/robots.txt` for `tlgs`, `indexer`, `archiver`,
   `researcher`, and `webproxy`;
 - fetches a page once when at least one virtual identity is eligible;
-- flushes new bodies to ROOT and then atomically publishes object locators,
+- stores new bodies under their BLAKE2b hash in `objects.sqlite3` and then
+  atomically publishes their catalog references,
   crawl history, discovered queue rows, and completion of the claimed row;
 - restores abandoned claims when reopening a snapshot;
 - records transport failures as historical results and schedules explicit retry
@@ -98,11 +99,15 @@ as unbounded catalog metadata. A completed robots response with no usable policy
 transport failure is recorded as `NetworkFailure` and does not complete the page.
 
 Bodies and certificates use BLAKE2b-256. Digests occupy 32-byte BLOBs in the
-catalog and bodies are deduplicated in compressed ROOT shards. Certificates
+catalog entries and bodies are deduplicated independently. Bodies live in a
+separate 4 KiB-page SQLite object store, with each object marked plaintext or
+zstd-compressed. Certificates
 are stored as canonical DER, interned once, and referenced by compact integer
 IDs from crawl results.
 
-A normal crawler exit closes its ROOT file but leaves the shard appendable.
+A normal crawler exit leaves both SQLite databases consistent and immediately
+usable by the next run.
+
 Later runs reuse that shard; rollover seals it only once the file reaches about
 1 GiB or is one week old. This keeps incremental snapshot backups coarse-grained
 instead of creating a new body file for every crawler invocation.

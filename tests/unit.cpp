@@ -1,16 +1,13 @@
-#include <TFile.h>
-#include <TKey.h>
-#include <TTree.h>
-
 #include <cassert>
 #include <filesystem>
+#include <sqlite3.h>
 
 #include "crawler.hpp"
 #include "archive_link_rewrite.hpp"
 #include "exclusion.hpp"
 #include "format.hpp"
 #include "media_type.hpp"
-#include "root_body_store.hpp"
+#include "object_store.hpp"
 #include "ssrf.hpp"
 #include "url_redirect.hpp"
 
@@ -180,57 +177,38 @@ int main() {
            "=> /archive/gemini/x/other.example%2Fa External\n"
            "=> https://example.org/ Web\n```\n=> untouched.gmi\n```\n");
 
-    const auto snapshot = std::filesystem::temp_directory_path() / "tardis-root-store-unit";
+    const auto snapshot = std::filesystem::temp_directory_path() / "tardis-object-store-unit";
     std::filesystem::remove_all(snapshot);
     std::filesystem::create_directories(snapshot);
     const std::string raw = "tiny Gemini body";
     tardis::Hash256 digest;
     digest.fill(std::byte{0x2a});
-    {
-        tardis::RootBodyStore store(snapshot, "bodies/test.root", 7);
-        store.put(digest, raw);
-        const auto locations = store.checkpoint();
-        assert(locations.size() == 1);
-        assert(locations[0].blake2b_256 == digest);
-        assert(locations[0].root_shard_id == 7);
-        assert(locations[0].root_entry_index == 0);
-        assert(store.entry_count() == 1);
-        store.close();
-    }
+    tardis::ObjectStore store(snapshot, true);
+    store.put(digest, raw);
+    assert(store.contains(digest));
+    assert(store.get(digest, raw.size()) == raw);
     const std::string second_raw = "body from a later crawler run";
     tardis::Hash256 second_digest;
     second_digest.fill(std::byte{0x2b});
-    {
-        // Normal process shutdown closes the file but does not seal a shard.
-        // The next run resumes at the catalog's published entry count.
-        tardis::RootBodyStore store(snapshot, "bodies/test.root", 7, 1);
-        store.put(second_digest, second_raw);
-        const auto locations = store.checkpoint();
-        assert(locations.size() == 1 && locations[0].root_entry_index == 1);
-        assert(store.entry_count() == 2);
-        assert(store.storage_bytes() > 0);
-        store.close();
-    }
-    std::unique_ptr<TFile> file(TFile::Open((snapshot / "bodies/test.root").c_str(), "READ"));
-    assert(file && !file->IsZombie());
-    int body_tree_keys = 0;
-    TIter next_key(file->GetListOfKeys());
-    while (const auto* key = dynamic_cast<TKey*>(next_key()))
-        if (std::string_view(key->GetName()) == "bodies")
-            ++body_tree_keys;
-    assert(body_tree_keys == 1);
-    auto* tree = file->Get<TTree>("bodies");
-    assert(tree);
-    assert(tree->GetEntries() == 2);
-    std::array<unsigned char, 32> stored_digest{};
-    std::vector<unsigned char>* stored = nullptr;
-    tree->SetBranchAddress("blake2b_256", stored_digest.data());
-    tree->SetBranchAddress("body", &stored);
-    assert(tree->GetEntry(0) > 0);
-    for (const auto byte : stored_digest) assert(byte == 0x2a);
-    assert(std::string(stored->begin(), stored->end()) == raw);
-    assert(tree->GetEntry(1) > 0);
-    for (const auto byte : stored_digest) assert(byte == 0x2b);
-    assert(std::string(stored->begin(), stored->end()) == second_raw);
+    store.put(second_digest, second_raw);
+    assert(store.get(second_digest, second_raw.size()) == second_raw);
+    tardis::Hash256 compressed_digest;
+    compressed_digest.fill(std::byte{0x2c});
+    const std::string repetitive(8192, 'x');
+    store.put(compressed_digest, repetitive);
+    assert(store.get(compressed_digest, repetitive.size()) == repetitive);
+    sqlite3* object_db{};
+    assert(sqlite3_open((snapshot / "objects.sqlite3").c_str(), &object_db) == SQLITE_OK);
+    sqlite3_stmt* page_size{};
+    assert(sqlite3_prepare_v2(object_db, "PRAGMA page_size", -1, &page_size, nullptr) == SQLITE_OK);
+    assert(sqlite3_step(page_size) == SQLITE_ROW && sqlite3_column_int(page_size, 0) == 4096);
+    sqlite3_finalize(page_size);
+    sqlite3_stmt* compressed_count{};
+    assert(sqlite3_prepare_v2(object_db, "SELECT count(*) FROM objects WHERE format=1", -1,
+                              &compressed_count, nullptr) == SQLITE_OK);
+    assert(sqlite3_step(compressed_count) == SQLITE_ROW &&
+           sqlite3_column_int(compressed_count, 0) == 1);
+    sqlite3_finalize(compressed_count);
+    sqlite3_close(object_db);
     std::filesystem::remove_all(snapshot);
 }

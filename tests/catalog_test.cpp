@@ -41,12 +41,8 @@ int main() {
                       (2,'gemini://example.org/next',1,900);
             INSERT INTO certificates(certificate_id,blake2b_256,certificate)
                 VALUES(1,zeroblob(32),x'010203');
-            INSERT INTO root_shards(root_shard_id,path,tree_name,compression,
-                                    created_unix_millis)
-                VALUES(1,'bodies/one.root','bodies',1,900);
-            INSERT INTO objects(object_id,blake2b_256,raw_bytes,root_shard_id,
-                                root_entry_index,created_unix_millis)
-                VALUES(1,zeroblob(32),12,1,0,900);
+            INSERT INTO objects(object_id,blake2b_256,raw_bytes,created_unix_millis)
+                VALUES(1,zeroblob(32),12,900);
             INSERT INTO crawl_results(
                 crawl_result_id,page_id,redirected_to_page_id,redirect_count,
                 certificate_id,started_at_unix_millis,ended_at_unix_millis,
@@ -96,7 +92,7 @@ int main() {
         tardis::Hash256 object_hash;
         object_hash.fill(std::byte{3});
         assert(!drogon::sync_wait(catalog.contains_object(object_hash)));
-        const auto object_id = drogon::sync_wait(catalog.publish_object({object_hash, 42, 1, 1}));
+        const auto object_id = drogon::sync_wait(catalog.publish_object({object_hash, 42}));
         assert(object_id == 2);
         assert(drogon::sync_wait(catalog.contains_object(object_hash)));
 
@@ -192,7 +188,7 @@ int main() {
         completed.result.meta = "text/gemini";
         completed.discovered_pages.push_back(
             {"gemini://example.org/discovered", "example.org"});
-        drogon::sync_wait(catalog.publish({}, {completed}, 1, 2));
+        drogon::sync_wait(catalog.publish({}, {completed}));
         const auto stats = drogon::sync_wait(catalog.stats());
         assert(stats.claimed == 0 && stats.queued == 1 && stats.crawl_results == 5);
         assert(drogon::sync_wait(catalog.next_ready_unix_millis()));
@@ -216,7 +212,7 @@ int main() {
         discovered_completed.automatic_next_enqueue_unix_millis = test_now + 20'000;
         discovered_completed.known_feed_type = "gemsub";
         discovered_completed.discovered_pages.push_back(discovered_completed.result.crawling_page);
-        drogon::sync_wait(catalog.publish({}, {discovered_completed}, 1, 2));
+        drogon::sync_wait(catalog.publish({}, {discovered_completed}));
         assert(drogon::sync_wait(catalog.stats()).queued == 0);
         const auto feeds = drogon::sync_wait(catalog.known_feeds(tardis::Use::archiver));
         assert(feeds.size() == 1 && feeds[0].page.url == "gemini://example.org/discovered" &&
@@ -242,7 +238,7 @@ int main() {
         gone_feed.result.status_code = 51;
         gone_feed.result.robots_bitfield = 31;
         gone_feed.retire_automatic_target = true;
-        drogon::sync_wait(catalog.publish({}, {gone_feed}, 1, 2));
+        drogon::sync_wait(catalog.publish({}, {gone_feed}));
         assert(drogon::sync_wait(catalog.known_feeds(tardis::Use::archiver)).empty());
         assert(drogon::sync_wait(catalog.due_watches(test_now + 30'000)).empty());
 
@@ -259,7 +255,7 @@ int main() {
         retry_result.result.robots_bitfield = 0;
         retry_result.result.meta = "Timeout";
         retry_result.retry_at_unix_millis = test_now + 30'000;
-        drogon::sync_wait(catalog.publish({}, {retry_result}, 1, 2));
+        drogon::sync_wait(catalog.publish({}, {retry_result}));
         const auto retry_stats = drogon::sync_wait(catalog.stats());
         assert(retry_stats.queued == 1 && retry_stats.claimed == 0);
         assert(drogon::sync_wait(catalog.next_ready_unix_millis()) == test_now + 30'000);
@@ -278,7 +274,7 @@ int main() {
         robots.checked_unix_millis = test_now + 31'001;
         robots.expires_unix_millis = test_now + 32'001;
         robots.cache_policy = true;
-        drogon::sync_wait(catalog.publish({}, {}, 1, 2, {robots}));
+        drogon::sync_wait(catalog.publish({}, {}, {robots}));
         const auto robots_history = drogon::sync_wait(
             catalog.archive("gemini://example.org/robots.txt", tardis::Use::archiver));
         assert(robots_history.size() == 1 && robots_history[0].status_code == 20);
@@ -318,11 +314,41 @@ int main() {
         certificate_completed.result.status_code = 20;
         certificate_completed.result.robots_bitfield = 31;
         certificate_completed.result.meta = "text/gemini";
-        drogon::sync_wait(catalog.publish({}, {certificate_completed}, 1, 2));
+        drogon::sync_wait(catalog.publish({}, {certificate_completed}));
         const auto certificate_history = drogon::sync_wait(
             catalog.archive(stale_cache_page.url, tardis::Use::archiver));
         assert(certificate_history.size() == 1 && certificate_history[0].certificate);
         assert(certificate_history[0].certificate->bytes == published_certificate.bytes);
+
+        // Rotations between system-trusted PKIX certificates are routine and
+        // must not enter the TOFU certificate-change feed. Crossing between
+        // TOFU and PKIX still does.
+        sqlite3* pkix_db = nullptr;
+        assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &pkix_db) == SQLITE_OK);
+        exec(pkix_db, R"sql(
+            INSERT INTO certificates(blake2b_256,certificate,pkix_verified)
+                VALUES(CAST(zeroblob(31)||x'03' AS BLOB),x'0303',1),
+                      (x'0400000000000000000000000000000000000000000000000000000000000000',x'0404',1);
+            INSERT INTO crawl_results(page_id,redirect_count,certificate_id,
+                                      started_at_unix_millis,ended_at_unix_millis,
+                                      committed_at_unix_millis,robots_bitfield)
+                VALUES(1,0,(SELECT certificate_id FROM certificates WHERE certificate=x'0303'),
+                       1700,1710,1710,0);
+            INSERT INTO crawl_results(page_id,redirect_count,certificate_id,
+                                      started_at_unix_millis,ended_at_unix_millis,
+                                      committed_at_unix_millis,robots_bitfield)
+                VALUES(1,0,(SELECT certificate_id FROM certificates WHERE certificate=x'0404'),
+                       1800,1810,1810,0);
+        )sql");
+        sqlite3_stmt* suppressed = nullptr;
+        assert(sqlite3_prepare_v2(
+                   pkix_db,
+                   "SELECT 1 FROM certificate_changes WHERE crawl_result_id="
+                   "(SELECT max(crawl_result_id) FROM crawl_results)",
+                   -1, &suppressed, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(suppressed) == SQLITE_DONE);
+        sqlite3_finalize(suppressed);
+        sqlite3_close(pkix_db);
     }
     {
         tardis::Catalog recovered(snapshot, 1, 5000);

@@ -24,7 +24,7 @@
 
 namespace tardis {
 
-class RootBodyStore;
+class ObjectStore;
 
 struct RobotsRule {
     bool allow{};
@@ -92,6 +92,7 @@ class Crawler {
         std::int64_t ended_at_unix_millis{};
         std::optional<Hash256> body_hash;
         std::optional<Hash256> certificate_hash;
+        bool certificate_pkix_verified{};
         std::vector<std::string> links;
         bool gemsub{};
         bool atom{};
@@ -135,11 +136,9 @@ class Crawler {
     drogon::Task<void> checkpoint();
     drogon::Task<void> drain_checkpoint();
     drogon::Task<void> wait_for_workers();
-    drogon::Task<void> wait_for_root_store();
     drogon::Task<void> wait_for_checkpoint();
     drogon::Task<void> wait_for_stop(std::optional<double> delay = std::nullopt);
     drogon::Task<void> enqueue_due_watches();
-    drogon::Task<void> ensure_root_store();
     drogon::Task<void> report_progress(std::string_view phase);
     drogon::Task<void> progress_tick();
     drogon::Task<void> wait_for_progress_tick();
@@ -151,7 +150,6 @@ class Crawler {
     bool reserve_active_authority(const std::string& authority);
     void release_active_authority(const std::string& authority);
     void finish_worker(bool did_work);
-    void wake_root_store_waiters();
     void wake_checkpoint_waiters();
     void wake_stop_waiter(bool timer_fired);
     std::optional<std::uint16_t> cached_robots_permissions(std::string_view authority,
@@ -164,12 +162,7 @@ class Crawler {
     trantor::EventLoop* loop_;
     Options options_;
     Catalog catalog_;
-    std::unique_ptr<RootBodyStore> root_bodies_;
-    std::int64_t root_shard_id_{};
-    std::int64_t root_shard_created_unix_millis_{};
-    bool root_store_creating_{};
-    std::mutex root_store_wait_mutex_;
-    std::vector<std::coroutine_handle<>> root_store_waiters_;
+    std::unique_ptr<ObjectStore> objects_;
     int snapshot_lock_fd_{-1};
 
     std::atomic_size_t active_workers_{};

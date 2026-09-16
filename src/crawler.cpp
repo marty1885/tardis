@@ -1,6 +1,6 @@
 #include "crawler.hpp"
+#include "object_store.hpp"
 
-#include <Compression.h>
 #include <drogon/HttpResponse.h>
 #include <drogon/drogon.h>
 #include <dremini/GeminiClient.hpp>
@@ -28,7 +28,6 @@
 
 #include "exclusion.hpp"
 #include "media_type.hpp"
-#include "root_body_store.hpp"
 #include "ssrf.hpp"
 #include "tlgs_link_compose.hpp"
 #include "url_redirect.hpp"
@@ -224,8 +223,6 @@ bool gemsub_feed(const std::vector<dremini::GeminiASTNode>& nodes, const Url& fe
 constexpr std::array<Use, 5> kUses{Use::tlgs, Use::indexer, Use::archiver, Use::researcher,
                                     Use::webproxy};
 constexpr std::size_t kRobotsCacheCapacity = 1024;
-constexpr std::uintmax_t kRootShardMaximumBytes = 1024ULL * 1024 * 1024;
-constexpr std::int64_t kRootShardMaximumAgeMillis = 7LL * 24 * 60 * 60 * 1000;
 }  // namespace
 
 std::string Url::host_key() const {
@@ -313,7 +310,6 @@ Crawler::Crawler(trantor::EventLoop* loop, Options options)
 Crawler::~Crawler() {
     if (progress_timer_)
         loop_->invalidateTimer(progress_timer_);
-    root_bodies_.reset();
     release_snapshot_lock();
 }
 
@@ -344,84 +340,10 @@ void Crawler::release_snapshot_lock() {
 void Crawler::open() {
     acquire_snapshot_lock();
     catalog_.open();
-}
-
-drogon::Task<void> Crawler::ensure_root_store() {
-    co_await drogon::switchThreadCoro(loop_);
-    const auto now = unix_millis();
-    if (root_bodies_ && root_bodies_->storage_bytes() < kRootShardMaximumBytes &&
-        now - root_shard_created_unix_millis_ < kRootShardMaximumAgeMillis)
-        co_return;
-    if (root_bodies_) {
-        // Keep each SQLite publication tied to one shard. Roll only between
-        // staged bodies, after the prior batch is fully durable.
-        co_await checkpoint();
-        const auto entries = root_bodies_->entry_count();
-        root_bodies_->close();
-        co_await catalog_.checkpoint_root_shard(root_shard_id_, entries, now);
-        root_bodies_.reset();
-        root_shard_id_ = 0;
-        root_shard_created_unix_millis_ = 0;
-    }
-    if (root_store_creating_) {
-        co_await wait_for_root_store();
-        if (!root_bodies_)
-            throw std::runtime_error("ROOT body shard creation failed");
-        co_return;
-    }
-    root_store_creating_ = true;
-    const auto compression =
-        ROOT::CompressionSettings(ROOT::RCompressionSetting::EAlgorithm::kZSTD, 3);
-    try {
-        auto shard = co_await catalog_.open_root_shard();
-        co_await drogon::switchThreadCoro(loop_);
-        std::exception_ptr reopen_failure;
-        if (shard) {
-            try {
-                root_bodies_ = std::make_unique<RootBodyStore>(
-                    options_.snapshot_dir, shard->path, shard->root_shard_id, shard->entry_count);
-                root_shard_id_ = shard->root_shard_id;
-                root_shard_created_unix_millis_ = shard->created_unix_millis;
-            } catch (...) {
-                reopen_failure = std::current_exception();
-            }
-        }
-        if (reopen_failure) {
-            // The catalog never points at entries beyond entry_count. An
-            // interrupted writer may leave extra physical ROOT entries;
-            // seal that unusable shard and start a clean replacement.
-            co_await catalog_.checkpoint_root_shard(shard->root_shard_id, shard->entry_count,
-                                                    now);
-            shard.reset();
-        }
-        if (root_bodies_ &&
-            (root_bodies_->storage_bytes() >= kRootShardMaximumBytes ||
-             now - root_shard_created_unix_millis_ >= kRootShardMaximumAgeMillis)) {
-            const auto entries = root_bodies_->entry_count();
-            root_bodies_->close();
-            co_await catalog_.checkpoint_root_shard(root_shard_id_, entries, now);
-            root_bodies_.reset();
-            root_shard_id_ = 0;
-            root_shard_created_unix_millis_ = 0;
-            shard.reset();
-        }
-        if (!shard) {
-            const auto relative = "bodies/shard-" + std::to_string(now) + "-" +
-                                  std::to_string(::getpid()) + ".root";
-            root_shard_id_ =
-                co_await catalog_.create_root_shard(relative, "bodies", compression);
-            co_await drogon::switchThreadCoro(loop_);
-            root_bodies_ = std::make_unique<RootBodyStore>(options_.snapshot_dir, relative,
-                                                            root_shard_id_);
-            root_shard_created_unix_millis_ = now;
-        }
-        root_store_creating_ = false;
-        wake_root_store_waiters();
-    } catch (...) {
-        root_store_creating_ = false;
-        wake_root_store_waiters();
-        throw;
-    }
+    // Drogon configures SQLite's global threading mode while creating its
+    // first client. Do that before this direct SQLite connection initializes
+    // the library.
+    objects_ = std::make_unique<ObjectStore>(options_.snapshot_dir, true);
 }
 
 void Crawler::add_seed(const std::string& value) {
@@ -469,22 +391,42 @@ drogon::Task<std::optional<Crawler::Response>> Crawler::fetch(
     std::chrono::seconds transfer_timeout, std::size_t max_body_bytes) {
     Response result;
     result.started_at_unix_millis = unix_millis();
-    auto certificate = std::make_shared<std::string>();
     try {
         auto* network_loop = drogon::app().getIOLoop(
             next_io_loop_.fetch_add(1, std::memory_order_relaxed) % options_.io_threads);
-        const auto response = co_await dremini::sendRequestCoro(
-            url.str(), request_timeout.count(), network_loop, max_body_bytes, {},
-            transfer_timeout.count(), hostname_only_trust(url.host(), certificate),
-            [](const trantor::InetAddress& address) {
-                return is_public_network_address(address.toIp());
-            });
+        auto request = [&](bool require_pkix, std::shared_ptr<std::string> certificate)
+            -> drogon::Task<drogon::HttpResponsePtr> {
+            co_return co_await dremini::sendRequestCoro(
+                url.str(), request_timeout.count(), network_loop, max_body_bytes, {},
+                transfer_timeout.count(), hostname_only_trust(url.host(), std::move(certificate)),
+                [](const trantor::InetAddress& address) {
+                    return is_public_network_address(address.toIp());
+                }, require_pkix);
+        };
+
+        // First try normal platform PKIX validation. A failure is deliberately
+        // retried through TOFU: an untrusted private CA is not special here.
+        auto certificate = std::make_shared<std::string>();
+        bool pkix_verified = false;
+        drogon::HttpResponsePtr response;
+        try {
+            response = co_await request(true, certificate);
+            pkix_verified = true;
+        } catch (const std::exception&) {
+            // The TOFU retry happens outside the handler: C++ coroutines do
+            // not permit an await expression directly in a catch block.
+        }
+        if (!pkix_verified) {
+            certificate = std::make_shared<std::string>();
+            response = co_await request(false, certificate);
+        }
         const auto status = std::stoi(response->getHeader("gemini-status"));
         if (status < 10 || status > 69)
             throw std::runtime_error("invalid Gemini status");
         result.status_code = static_cast<std::int16_t>(status);
         result.meta = response->getHeader("meta");
         result.certificate = std::move(*certificate);
+        result.certificate_pkix_verified = pkix_verified;
         result.body = response->body();
         if (result.body.size() > max_body_bytes)
             result.error = "BodyTooLarge";
@@ -792,21 +734,15 @@ drogon::Task<void> Crawler::stage_body(Response& response) {
     if (!response.body_hash)
         co_return;
     const auto key = hash_key(*response.body_hash);
-    co_await drogon::switchThreadCoro(loop_);
+    // process() owns the staging batch on loop_; no storage-specific hop is
+    // needed here now that bodies are plain SQLite rows.
     if (pending_object_keys_.contains(key))
         co_return;
-    const auto known = co_await catalog_.contains_object(*response.body_hash);
-    co_await drogon::switchThreadCoro(loop_);
-    // Another worker may have staged the same digest while the catalog read
-    // was in flight. All access to this set is deliberately on loop_.
-    if (known || pending_object_keys_.contains(key))
+    if (objects_->contains(*response.body_hash) || pending_object_keys_.contains(key))
         co_return;
-    co_await ensure_root_store();
-    const auto entry_index = root_bodies_->entry_count();
-    root_bodies_->put(*response.body_hash, response.body);
+    objects_->put(*response.body_hash, response.body);
     unpublished_objects_.push_back(
-        {*response.body_hash, static_cast<std::int64_t>(response.body.size()), root_shard_id_,
-         entry_index});
+        {*response.body_hash, static_cast<std::int64_t>(response.body.size())});
     pending_object_keys_.insert(key);
 }
 
@@ -835,7 +771,8 @@ drogon::Task<void> Crawler::process(const QueueClaim& claim, const Url& url, Res
         capture.result.object_blake2b_256 = robots.body_hash;
         if (robots.certificate_hash)
             capture.result.certificate = Certificate{*robots.certificate_hash,
-                                                     std::move(robots.certificate)};
+                                                     std::move(robots.certificate),
+                                                     robots.certificate_pkix_verified};
         capture.policy_source = std::move(robots_source);
         capture.checked_unix_millis = unix_millis();
         capture.expires_unix_millis = capture.checked_unix_millis + 24LL * 60 * 60 * 1000;
@@ -860,7 +797,8 @@ drogon::Task<void> Crawler::process(const QueueClaim& claim, const Url& url, Res
     completed.retry_at_unix_millis = retry_at_unix_millis;
     if (response.certificate_hash)
         completed.result.certificate = Certificate{*response.certificate_hash,
-                                                   std::move(response.certificate)};
+                                                   std::move(response.certificate),
+                                                   response.certificate_pkix_verified};
 
     if (response.error.empty() && response.status_code && *response.status_code / 10 == 2 &&
         response.body_hash) {
@@ -923,7 +861,7 @@ drogon::Task<void> Crawler::process(const QueueClaim& claim, const Url& url, Res
     }
     pending_.push_back({std::move(completed), std::move(robots_capture)});
     release_active_authority(claim.authority);
-    if ((root_bodies_ && root_bodies_->checkpoint_due()) || pending_.size() >= 128)
+    if (pending_.size() >= 128)
         co_await checkpoint();
 }
 
@@ -936,8 +874,6 @@ drogon::Task<void> Crawler::checkpoint() {
     auto objects = std::move(unpublished_objects_);
     pending_.clear();
     unpublished_objects_.clear();
-    if (root_bodies_)
-        root_bodies_->checkpoint();
     std::vector<CompletedCrawl> crawls;
     crawls.reserve(pending.size());
     std::vector<RobotsCapture> robots;
@@ -949,9 +885,7 @@ drogon::Task<void> Crawler::checkpoint() {
     }
     std::exception_ptr failure;
     try {
-        co_await catalog_.publish(objects, crawls, root_shard_id_,
-                                  root_bodies_ ? root_bodies_->entry_count() : 0,
-                                  std::move(robots));
+        co_await catalog_.publish(objects, crawls, std::move(robots));
         co_await drogon::switchThreadCoro(loop_);
         for (const auto& object : objects)
             pending_object_keys_.erase(hash_key(object.blake2b_256));
@@ -1224,26 +1158,6 @@ drogon::Task<void> Crawler::wait_for_workers() {
     co_await Awaiter{*this};
 }
 
-drogon::Task<void> Crawler::wait_for_root_store() {
-    struct Awaiter {
-        Crawler& crawler;
-
-        bool await_ready() const noexcept { return !crawler.root_store_creating_; }
-
-        bool await_suspend(std::coroutine_handle<> handle) noexcept {
-            std::lock_guard lock(crawler.root_store_wait_mutex_);
-            if (!crawler.root_store_creating_)
-                return false;
-            crawler.root_store_waiters_.push_back(handle);
-            return true;
-        }
-
-        void await_resume() const noexcept {}
-    };
-
-    co_await Awaiter{*this};
-}
-
 drogon::Task<void> Crawler::wait_for_checkpoint() {
     struct Awaiter {
         Crawler& crawler;
@@ -1262,16 +1176,6 @@ drogon::Task<void> Crawler::wait_for_checkpoint() {
     };
 
     co_await Awaiter{*this};
-}
-
-void Crawler::wake_root_store_waiters() {
-    std::vector<std::coroutine_handle<>> waiters;
-    {
-        std::lock_guard lock(root_store_wait_mutex_);
-        waiters.swap(root_store_waiters_);
-    }
-    for (const auto waiter : waiters)
-        loop_->queueInLoop([waiter] { waiter.resume(); });
 }
 
 void Crawler::wake_checkpoint_waiters() {
@@ -1356,6 +1260,15 @@ void Crawler::finish_worker(bool did_work) {
 }
 
 drogon::Task<void> Crawler::run() {
+    co_await drogon::switchThreadCoro(loop_);
+    progress_timer_ = loop_->runEvery(
+        static_cast<double>(options_.progress_interval.count()), [this] {
+            if (progress_tick_in_flight_ || stop_requested_)
+                return;
+            progress_tick_in_flight_ = true;
+            drogon::async_run([this]() -> drogon::Task<void> { co_await progress_tick(); });
+        });
+    co_await report_progress("starting");
     while (!stop_requested_) {
         // Do not let a burst of newly recognized automatic targets delay
         // ordinary discovery work.  In particular, one security.txt target
@@ -1394,16 +1307,15 @@ drogon::Task<void> Crawler::run() {
     while (active_workers_.load(std::memory_order_acquire))
         co_await wait_for_workers();
     co_await drain_checkpoint();
+    co_await drogon::switchThreadCoro(loop_);
+    if (progress_timer_) {
+        loop_->invalidateTimer(progress_timer_);
+        progress_timer_ = {};
+    }
+    co_await wait_for_progress_tick();
+    co_await report_progress("finished");
     if (worker_error_)
         std::rethrow_exception(worker_error_);
-    if (root_bodies_) {
-        const auto now = unix_millis();
-        const auto entries = root_bodies_->entry_count();
-        root_bodies_->close();
-        // Closing a process is not a shard rollover. Leave it appendable for
-        // the next run so incremental backups remain coarse-grained.
-        co_await catalog_.checkpoint_root_shard(root_shard_id_, entries);
-    }
 }
 
 drogon::Task<Json::Value> Crawler::status() {

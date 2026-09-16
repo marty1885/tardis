@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "crawler.hpp"
-#include "root_body_store.hpp"
 #include "sandbox.hpp"
 #include <trantor/net/Resolver.h>
 
@@ -181,7 +180,6 @@ int main(int argc, char** argv) {
         }
 
         tardis::sandbox::warm_up_openssl();
-        tardis::warm_up_root_body_store();
         tardis::sandbox::Policy sandbox_policy;
         sandbox_policy.read_only = {"/etc/hosts", "/etc/host.conf", "/etc/nsswitch.conf",
                                     "/etc/resolv.conf", "/etc/gai.conf",

@@ -137,15 +137,13 @@ CrawlResult decode_result(const drogon::orm::Row& row) {
         certificate.blake2b_256 = hash_from_blob(row["certificate_hash"].as<std::vector<char>>());
         const auto bytes = row["certificate_bytes"].as<std::vector<char>>();
         certificate.bytes.assign(bytes.begin(), bytes.end());
+        certificate.pkix_verified = row["certificate_pkix_verified"].as<bool>();
         result.certificate = std::move(certificate);
     }
     if (!row["object_hash"].isNull()) {
         Object object;
         object.blake2b_256 = hash_from_blob(row["object_hash"].as<std::vector<char>>());
         object.raw_bytes = row["raw_bytes"].as<std::int64_t>();
-        object.root_shard_path = row["root_shard_path"].as<std::string>();
-        object.root_tree_name = row["root_tree_name"].as<std::string>();
-        object.root_entry_index = row["root_entry_index"].as<std::int64_t>();
         result.object = std::move(object);
     }
     return result;
@@ -164,17 +162,14 @@ SELECT cr.crawl_result_id,
        cr.meta,
        certificates.blake2b_256 AS certificate_hash,
        certificates.certificate AS certificate_bytes,
+       certificates.pkix_verified AS certificate_pkix_verified,
        objects.blake2b_256 AS object_hash,
-       objects.raw_bytes,
-       root_shards.path AS root_shard_path,
-       root_shards.tree_name AS root_tree_name,
-       objects.root_entry_index
+       objects.raw_bytes
 FROM crawl_results AS cr
 JOIN pages AS p ON p.page_id = cr.page_id
 LEFT JOIN pages AS redirected ON redirected.page_id = cr.redirected_to_page_id
 LEFT JOIN certificates ON certificates.certificate_id = cr.certificate_id
 LEFT JOIN objects ON objects.object_id = cr.object_id
-LEFT JOIN root_shards ON root_shards.root_shard_id = objects.root_shard_id
 )sql";
 
 }  // namespace
@@ -228,25 +223,14 @@ void Catalog::open(bool recover_claims) {
         R"sql(CREATE TABLE IF NOT EXISTS certificates (
             certificate_id INTEGER PRIMARY KEY,
             blake2b_256 BLOB NOT NULL UNIQUE CHECK(length(blake2b_256) = 32),
-            certificate BLOB NOT NULL
-        ) STRICT)sql",
-        R"sql(CREATE TABLE IF NOT EXISTS root_shards (
-            root_shard_id INTEGER PRIMARY KEY,
-            path TEXT NOT NULL UNIQUE,
-            tree_name TEXT NOT NULL,
-            compression INTEGER NOT NULL,
-            entry_count INTEGER NOT NULL DEFAULT 0,
-            created_unix_millis INTEGER NOT NULL,
-            sealed_unix_millis INTEGER
+            certificate BLOB NOT NULL,
+            pkix_verified INTEGER NOT NULL DEFAULT 0 CHECK(pkix_verified IN (0,1))
         ) STRICT)sql",
         R"sql(CREATE TABLE IF NOT EXISTS objects (
             object_id INTEGER PRIMARY KEY,
             blake2b_256 BLOB NOT NULL UNIQUE CHECK(length(blake2b_256) = 32),
             raw_bytes INTEGER NOT NULL,
-            root_shard_id INTEGER NOT NULL REFERENCES root_shards(root_shard_id),
-            root_entry_index INTEGER NOT NULL,
-            created_unix_millis INTEGER NOT NULL,
-            UNIQUE(root_shard_id, root_entry_index)
+            created_unix_millis INTEGER NOT NULL
         ) STRICT)sql",
         R"sql(CREATE TABLE IF NOT EXISTS hosts (
             host_id INTEGER PRIMARY KEY,
@@ -363,6 +347,18 @@ void Catalog::open(bool recover_claims) {
         ) STRICT)sql",
     };
     for (const auto* statement : statements) writer_->execSqlSync(statement);
+    const auto certificate_columns = writer_->execSqlSync("PRAGMA table_info(certificates)");
+    bool has_pkix_verified = false;
+    for (const auto& column : certificate_columns)
+        if (column["name"].as<std::string>() == "pkix_verified") {
+            has_pkix_verified = true;
+            break;
+        }
+    if (!has_pkix_verified)
+        writer_->execSqlSync(
+            "ALTER TABLE certificates ADD COLUMN pkix_verified INTEGER NOT NULL DEFAULT 0 "
+            "CHECK(pkix_verified IN (0,1))");
+    writer_->execSqlSync("DROP TRIGGER IF EXISTS record_certificate_change");
     writer_->execSqlSync(R"sql(
         CREATE TRIGGER IF NOT EXISTS record_certificate_change
         AFTER INSERT ON crawl_results
@@ -376,14 +372,48 @@ void Catalog::open(bool recover_claims) {
             FROM pages AS current_page
             JOIN pages AS previous_page ON previous_page.host_id=current_page.host_id
             JOIN crawl_results AS previous ON previous.page_id=previous_page.page_id
+            JOIN certificates AS previous_certificate
+                 ON previous_certificate.certificate_id=previous.certificate_id
+            JOIN certificates AS current_certificate
+                 ON current_certificate.certificate_id=NEW.certificate_id
             WHERE current_page.page_id=NEW.page_id
               AND previous.certificate_id IS NOT NULL
               AND previous.crawl_result_id < NEW.crawl_result_id
               AND previous.certificate_id != NEW.certificate_id
+              -- Compare with the last certificate observation, rather than
+              -- skipping a PKIX rotation and then comparing to stale TOFU.
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM crawl_results AS newer
+                  JOIN pages AS newer_page ON newer_page.page_id=newer.page_id
+                  WHERE newer_page.host_id=current_page.host_id
+                    AND newer.certificate_id IS NOT NULL
+                    AND newer.crawl_result_id < NEW.crawl_result_id
+                    AND newer.crawl_result_id > previous.crawl_result_id
+              )
+              -- A rotation within the system-trusted PKIX ecosystem is expected
+              -- and is not a TOFU alert. Enter/leave that ecosystem is.
+              AND (previous_certificate.pkix_verified=0 OR current_certificate.pkix_verified=0)
             ORDER BY previous.crawl_result_id DESC
             LIMIT 1;
         END
     )sql");
+    const auto pkix_backfill = writer_->execSqlSync(
+        "SELECT 1 FROM snapshot_meta WHERE key='certificate_changes_pkix_v1' LIMIT 1");
+    if (pkix_backfill.empty()) {
+        writer_->execSqlSync(R"sql(
+            DELETE FROM certificate_changes
+            WHERE EXISTS (SELECT 1 FROM certificates AS previous_certificate
+                          WHERE previous_certificate.certificate_id=previous_certificate_id
+                            AND previous_certificate.pkix_verified=1)
+              AND EXISTS (SELECT 1 FROM certificates AS current_certificate
+                          WHERE current_certificate.certificate_id=certificate_id
+                            AND current_certificate.pkix_verified=1)
+        )sql");
+        writer_->execSqlSync(
+            "INSERT INTO snapshot_meta(key,value) VALUES"
+            "('certificate_changes_pkix_v1','complete')");
+    }
     const auto certificate_backfill = writer_->execSqlSync(
         "SELECT 1 FROM snapshot_meta WHERE key='certificate_changes_backfill_v1' LIMIT 1");
     if (certificate_backfill.empty()) {
@@ -663,9 +693,13 @@ drogon::Task<std::int64_t> Catalog::append(NewCrawlResult result) {
         if (result.certificate) {
             const auto hash = blob_from_hash(result.certificate->blake2b_256);
             co_await transaction->execSqlCoro(
-                "INSERT OR IGNORE INTO certificates(blake2b_256,certificate) "
-                "VALUES(CAST(? AS BLOB),?)",
-                hash, blob_from_bytes(result.certificate->bytes));
+                "INSERT OR IGNORE INTO certificates(blake2b_256,certificate,pkix_verified) "
+                "VALUES(CAST(? AS BLOB),?,?)",
+                hash, blob_from_bytes(result.certificate->bytes), result.certificate->pkix_verified);
+            co_await transaction->execSqlCoro(
+                "UPDATE certificates SET pkix_verified=1 "
+                "WHERE blake2b_256=CAST(? AS BLOB) AND ?", hash,
+                result.certificate->pkix_verified);
             const auto rows = co_await transaction->execSqlCoro(
                 "SELECT certificate_id,certificate FROM certificates "
                 "WHERE blake2b_256=CAST(? AS BLOB)",
@@ -717,63 +751,16 @@ drogon::Task<bool> Catalog::contains_object(const Hash256& blake2b_256) {
     co_return !rows.empty();
 }
 
-drogon::Task<std::int64_t> Catalog::create_root_shard(std::string path, std::string tree_name,
-                                                      std::int64_t compression) {
-    if (!writer_)
-        throw std::logic_error("catalog is not open");
-    if (path.empty() || tree_name.empty())
-        throw std::invalid_argument("a ROOT shard requires a path and tree name");
-    const auto inserted = co_await writer_->execSqlCoro(
-        "INSERT INTO root_shards(path,tree_name,compression,created_unix_millis) "
-        "VALUES(?,?,?,CAST(unixepoch('subsec')*1000 AS INTEGER))",
-        std::move(path), std::move(tree_name), compression);
-    co_return inserted.insertId();
-}
-
-drogon::Task<std::optional<RootShard>> Catalog::open_root_shard() {
-    if (!reader_)
-        throw std::logic_error("catalog is not open");
-    const auto rows = co_await reader_->execSqlCoro(
-        "SELECT root_shard_id,path,tree_name,compression,entry_count,created_unix_millis "
-        "FROM root_shards WHERE sealed_unix_millis IS NULL "
-        "ORDER BY created_unix_millis DESC,root_shard_id DESC LIMIT 1");
-    if (rows.empty())
-        co_return std::nullopt;
-    RootShard shard;
-    shard.root_shard_id = rows[0]["root_shard_id"].as<std::int64_t>();
-    shard.path = rows[0]["path"].as<std::string>();
-    shard.tree_name = rows[0]["tree_name"].as<std::string>();
-    shard.compression = rows[0]["compression"].as<std::int64_t>();
-    shard.entry_count = rows[0]["entry_count"].as<std::int64_t>();
-    shard.created_unix_millis = rows[0]["created_unix_millis"].as<std::int64_t>();
-    co_return shard;
-}
-
-drogon::Task<void> Catalog::checkpoint_root_shard(std::int64_t root_shard_id,
-                                                  std::int64_t entry_count,
-                                                  std::optional<std::int64_t> sealed_unix_millis) {
-    if (!writer_)
-        throw std::logic_error("catalog is not open");
-    if (root_shard_id <= 0 || entry_count < 0)
-        throw std::invalid_argument("invalid ROOT shard checkpoint");
-    const auto updated = co_await writer_->execSqlCoro(
-        "UPDATE root_shards SET entry_count=?,sealed_unix_millis=? WHERE root_shard_id=?",
-        entry_count, sealed_unix_millis, root_shard_id);
-    if (updated.affectedRows() != 1)
-        throw std::invalid_argument("unknown ROOT shard");
-}
-
 drogon::Task<std::int64_t> Catalog::publish_object(NewObject object) {
     if (!writer_)
         throw std::logic_error("catalog is not open");
-    if (object.raw_bytes < 0 || object.root_shard_id <= 0 || object.root_entry_index < 0)
+    if (object.raw_bytes < 0)
         throw std::invalid_argument("invalid object location");
     const auto hash = blob_from_hash(object.blake2b_256);
     co_await writer_->execSqlCoro(
-        "INSERT OR IGNORE INTO objects(blake2b_256,raw_bytes,root_shard_id,"
-        "root_entry_index,created_unix_millis) "
-        "VALUES(CAST(? AS BLOB),?,?,?,CAST(unixepoch('subsec')*1000 AS INTEGER))",
-        hash, object.raw_bytes, object.root_shard_id, object.root_entry_index);
+        "INSERT OR IGNORE INTO objects(blake2b_256,raw_bytes,created_unix_millis) "
+        "VALUES(CAST(? AS BLOB),?,CAST(unixepoch('subsec')*1000 AS INTEGER))",
+        hash, object.raw_bytes);
     const auto rows = co_await writer_->execSqlCoro(
         "SELECT object_id,raw_bytes FROM objects WHERE blake2b_256=CAST(? AS BLOB)", hash);
     if (rows.empty())
@@ -1043,8 +1030,6 @@ drogon::Task<void> Catalog::discard(const QueueClaim& claim) {
 
 drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
                                     std::vector<CompletedCrawl> crawls,
-                                    std::int64_t root_shard_id,
-                                    std::int64_t root_entry_count,
                                     std::vector<RobotsCapture> robots) {
     if (!writer_)
         throw std::logic_error("catalog is not open");
@@ -1067,22 +1052,14 @@ drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
     };
     try {
         for (const auto& object : objects) {
-            if (object.raw_bytes < 0 || object.root_shard_id != root_shard_id ||
-                object.root_entry_index < 0)
+            if (object.raw_bytes < 0)
                 throw std::invalid_argument("invalid published object");
             co_await transaction->execSqlCoro(
-                "INSERT OR IGNORE INTO objects(blake2b_256,raw_bytes,root_shard_id,"
-                "root_entry_index,created_unix_millis) VALUES(CAST(? AS BLOB),?,?,?,"
+                "INSERT OR IGNORE INTO objects(blake2b_256,raw_bytes,created_unix_millis) "
+                "VALUES(CAST(? AS BLOB),?,"
                 "CAST(unixepoch('subsec')*1000 AS INTEGER))",
-                blob_from_hash(object.blake2b_256), object.raw_bytes, object.root_shard_id,
-                object.root_entry_index);
+                blob_from_hash(object.blake2b_256), object.raw_bytes);
         }
-        if (root_shard_id > 0)
-            co_await transaction->execSqlCoro(
-                "UPDATE root_shards SET entry_count=? WHERE root_shard_id=?",
-                root_entry_count, root_shard_id);
-        else if (!objects.empty())
-            throw std::invalid_argument("objects require a ROOT shard");
 
         std::set<std::int64_t> affected_hosts;
         for (auto& completed : crawls) {
@@ -1103,9 +1080,13 @@ drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
             if (result.certificate) {
                 const auto hash = blob_from_hash(result.certificate->blake2b_256);
                 co_await transaction->execSqlCoro(
-                    "INSERT OR IGNORE INTO certificates(blake2b_256,certificate) "
-                    "VALUES(CAST(? AS BLOB),?)",
-                    hash, blob_from_bytes(result.certificate->bytes));
+                "INSERT OR IGNORE INTO certificates(blake2b_256,certificate,pkix_verified) "
+                "VALUES(CAST(? AS BLOB),?,?)",
+                hash, blob_from_bytes(result.certificate->bytes), result.certificate->pkix_verified);
+            co_await transaction->execSqlCoro(
+                "UPDATE certificates SET pkix_verified=1 "
+                "WHERE blake2b_256=CAST(? AS BLOB) AND ?", hash,
+                result.certificate->pkix_verified);
                 const auto rows = co_await transaction->execSqlCoro(
                     "SELECT certificate_id,certificate FROM certificates "
                     "WHERE blake2b_256=CAST(? AS BLOB)",
@@ -1269,9 +1250,13 @@ drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
             if (result.certificate) {
                 const auto hash = blob_from_hash(result.certificate->blake2b_256);
                 co_await transaction->execSqlCoro(
-                    "INSERT OR IGNORE INTO certificates(blake2b_256,certificate) "
-                    "VALUES(CAST(? AS BLOB),?)",
-                    hash, blob_from_bytes(result.certificate->bytes));
+                "INSERT OR IGNORE INTO certificates(blake2b_256,certificate,pkix_verified) "
+                "VALUES(CAST(? AS BLOB),?,?)",
+                hash, blob_from_bytes(result.certificate->bytes), result.certificate->pkix_verified);
+            co_await transaction->execSqlCoro(
+                "UPDATE certificates SET pkix_verified=1 "
+                "WHERE blake2b_256=CAST(? AS BLOB) AND ?", hash,
+                result.certificate->pkix_verified);
                 const auto rows = co_await transaction->execSqlCoro(
                     "SELECT certificate_id,certificate FROM certificates "
                     "WHERE blake2b_256=CAST(? AS BLOB)",

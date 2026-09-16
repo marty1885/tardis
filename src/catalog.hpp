@@ -60,23 +60,15 @@ enum class QueueState : std::uint8_t {
 struct Certificate {
     Hash256 blake2b_256{};
     std::string bytes;
+    // True only when the connection completed system-store PKIX validation.
+    // Certificates from an untrusted CA deliberately remain false: they use
+    // the same TOFU/change-detection path as self-signed certificates.
+    bool pkix_verified{};
 };
 
 struct Object {
     Hash256 blake2b_256{};
     std::int64_t raw_bytes{};
-    std::string root_shard_path;
-    std::string root_tree_name;
-    std::int64_t root_entry_index{};
-};
-
-struct RootShard {
-    std::int64_t root_shard_id{};
-    std::string path;
-    std::string tree_name;
-    std::int64_t compression{};
-    std::int64_t entry_count{};
-    std::int64_t created_unix_millis{};
 };
 
 struct CrawlResult {
@@ -139,8 +131,6 @@ struct NewCrawlResult {
 struct NewObject {
     Hash256 blake2b_256{};
     std::int64_t raw_bytes{};
-    std::int64_t root_shard_id{};
-    std::int64_t root_entry_index{};
 };
 
 struct QueueEntry {
@@ -277,19 +267,10 @@ class Catalog {
                                                  const std::vector<std::string>& mime_types = {});
 
     // Appends history and advances the page's latest pointer in one writer
-    // transaction. Referenced objects must already have durable ROOT locators.
+    // transaction. Referenced objects must already be durable in objects.sqlite3.
     drogon::Task<std::int64_t> append(NewCrawlResult result);
 
     drogon::Task<bool> contains_object(const Hash256& blake2b_256);
-    drogon::Task<std::int64_t> create_root_shard(std::string path, std::string tree_name,
-                                                 std::int64_t compression);
-    // At most one shard is open for appends. It is deliberately not tied to a
-    // crawler process: a later run reopens it until the rollover policy seals it.
-    drogon::Task<std::optional<RootShard>> open_root_shard();
-    drogon::Task<void> checkpoint_root_shard(
-        std::int64_t root_shard_id, std::int64_t entry_count,
-        std::optional<std::int64_t> sealed_unix_millis = std::nullopt);
-    // Call only after the referenced ROOT entry is durable.
     drogon::Task<std::int64_t> publish_object(NewObject object);
 
     drogon::Task<void> watch(PageAddress page, std::int64_t next_enqueue_unix_millis);
@@ -314,13 +295,11 @@ class Catalog {
     drogon::Task<void> release(const QueueClaim& claim, std::int64_t ready_at_unix_millis);
     drogon::Task<void> discard(const QueueClaim& claim);
 
-    // ROOT must already contain every object in this batch. Object publication,
+    // objects.sqlite3 must already contain every object in this batch. Object publication,
     // history append, discovered-page enqueue, and queue completion are one
     // SQLite transaction.
     drogon::Task<void> publish(std::vector<NewObject> objects,
                                std::vector<CompletedCrawl> crawls,
-                               std::int64_t root_shard_id,
-                               std::int64_t root_entry_count,
                                std::vector<RobotsCapture> robots = {});
 
     drogon::Task<std::optional<std::int64_t>> next_ready_unix_millis();
