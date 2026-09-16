@@ -129,10 +129,13 @@ std::string archive_banner(const CrawlResult& result) {
     const auto mime = result.meta.value_or("application/octet-stream");
     const auto size = result.object ? result.object->raw_bytes : 0;
     const auto certificate = result.certificate ? hex(result.certificate->blake2b_256) : "none";
-    return "> Archive of " + result.crawling_url + " received at " +
-           utc_timestamp(result.ended_at_unix_millis) + ".\n> mime: " + mime +
-           "\n> size: " + std::to_string(size) + "\n> certificate: " + certificate +
-           "\n\n";
+    return "```\n"
+        "Archive of " + result.crawling_url + " received at " +
+        utc_timestamp(result.ended_at_unix_millis) + ".\n> mime: " + mime +
+        "\n> size: " + std::to_string(size) + "\n> certificate: " + certificate +
+        "\n"
+        "```\n"
+        "\n";
 }
 
 std::string one_line(std::string value) {
@@ -166,9 +169,9 @@ std::string history_link(const CrawlResult& result) {
 
 std::string archive_navigation(const CrawlResult& result,
                                const tardis::ArchiveNeighbors& neighbors) {
-    std::string body = "=> " + history_link(result) + " Page history\n";
-    if (neighbors.previous) body += "=> " + version_link(*neighbors.previous) + " Previous version\n";
-    if (neighbors.next) body += "=> " + version_link(*neighbors.next) + " Next version\n";
+    std::string body = "=> " + history_link(result) + " 📜 Page history\n";
+    if (neighbors.previous) body += "=> " + version_link(*neighbors.previous) + " ⬅ Previous version\n";
+    if (neighbors.next) body += "=> " + version_link(*neighbors.next) + " ➡ Next version\n";
     return body;
 }
 
