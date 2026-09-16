@@ -197,11 +197,21 @@ Catalog::Catalog(std::filesystem::path snapshot_dir, std::size_t read_connection
 }
 
 void Catalog::open(bool recover_claims) {
+    const auto database = snapshot_dir_ / "catalog.sqlite3";
     std::filesystem::create_directories(snapshot_dir_);
-    const auto connection = "filename=" + (snapshot_dir_ / "catalog.sqlite3").string();
+    const auto connection = "filename=" + database.string();
     reader_ = drogon::orm::DbClient::newSqlite3Client(connection, read_connections_);
-    writer_ = drogon::orm::DbClient::newSqlite3Client(connection, 1);
+    // Changing journal_mode and applying migrations both require a write lock.
+    // The crawler owns that work under its snapshot lock; a serving process
+    // shares the catalog with an active crawler and must only open it.
+    if (!recover_claims) {
+        reader_->execSqlSync("PRAGMA foreign_keys=ON");
+        reader_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
+        reader_->execSqlSync("PRAGMA temp_store=MEMORY");
+        return;
+    }
 
+    writer_ = drogon::orm::DbClient::newSqlite3Client(connection, 1);
     writer_->execSqlSync("PRAGMA journal_mode=WAL");
     writer_->execSqlSync("PRAGMA synchronous=NORMAL");
     writer_->execSqlSync("PRAGMA foreign_keys=ON");
@@ -282,6 +292,11 @@ void Catalog::open(bool recover_claims) {
             observed_at_unix_millis INTEGER NOT NULL,
             CHECK(previous_certificate_id != certificate_id)
         ) STRICT)sql",
+        R"sql(CREATE TABLE IF NOT EXISTS host_certificate_state (
+            host_id INTEGER PRIMARY KEY REFERENCES hosts(host_id),
+            crawl_result_id INTEGER NOT NULL UNIQUE REFERENCES crawl_results(crawl_result_id),
+            certificate_id INTEGER NOT NULL REFERENCES certificates(certificate_id)
+        ) STRICT)sql",
         R"sql(CREATE INDEX IF NOT EXISTS crawl_results_by_page
             ON crawl_results(page_id, started_at_unix_millis DESC,
                              crawl_result_id DESC))sql",
@@ -358,6 +373,34 @@ void Catalog::open(bool recover_claims) {
         writer_->execSqlSync(
             "ALTER TABLE certificates ADD COLUMN pkix_verified INTEGER NOT NULL DEFAULT 0 "
             "CHECK(pkix_verified IN (0,1))");
+    // Keep the last certificate observation per host as materialized state.
+    // Deriving it inside the insert trigger used to perform a correlated scan
+    // over crawl_results for every candidate predecessor, making inserts
+    // quadratic as the archive grew.
+    const auto certificate_state_backfill = writer_->execSqlSync(
+        "SELECT 1 FROM snapshot_meta WHERE key='host_certificate_state_v1' LIMIT 1");
+    if (certificate_state_backfill.empty()) {
+        writer_->execSqlSync(R"sql(
+            INSERT INTO host_certificate_state(host_id,crawl_result_id,certificate_id)
+            SELECT host_id,crawl_result_id,certificate_id
+            FROM (
+                SELECT p.host_id,cr.crawl_result_id,cr.certificate_id,
+                       row_number() OVER (
+                           PARTITION BY p.host_id ORDER BY cr.crawl_result_id DESC) AS position
+                FROM crawl_results AS cr
+                JOIN pages AS p ON p.page_id=cr.page_id
+                WHERE cr.certificate_id IS NOT NULL
+            )
+            WHERE position=1
+            ON CONFLICT(host_id) DO UPDATE SET
+                crawl_result_id=excluded.crawl_result_id,
+                certificate_id=excluded.certificate_id
+            WHERE excluded.crawl_result_id>host_certificate_state.crawl_result_id
+        )sql");
+        writer_->execSqlSync(
+            "INSERT INTO snapshot_meta(key,value) VALUES"
+            "('host_certificate_state_v1','complete')");
+    }
     writer_->execSqlSync("DROP TRIGGER IF EXISTS record_certificate_change");
     writer_->execSqlSync(R"sql(
         CREATE TRIGGER IF NOT EXISTS record_certificate_change
@@ -370,32 +413,24 @@ void Catalog::open(bool recover_claims) {
             SELECT current_page.host_id,previous.crawl_result_id,previous.certificate_id,
                    NEW.crawl_result_id,NEW.certificate_id,NEW.ended_at_unix_millis
             FROM pages AS current_page
-            JOIN pages AS previous_page ON previous_page.host_id=current_page.host_id
-            JOIN crawl_results AS previous ON previous.page_id=previous_page.page_id
+            JOIN host_certificate_state AS previous
+                 ON previous.host_id=current_page.host_id
             JOIN certificates AS previous_certificate
                  ON previous_certificate.certificate_id=previous.certificate_id
             JOIN certificates AS current_certificate
                  ON current_certificate.certificate_id=NEW.certificate_id
             WHERE current_page.page_id=NEW.page_id
-              AND previous.certificate_id IS NOT NULL
-              AND previous.crawl_result_id < NEW.crawl_result_id
               AND previous.certificate_id != NEW.certificate_id
-              -- Compare with the last certificate observation, rather than
-              -- skipping a PKIX rotation and then comparing to stale TOFU.
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM crawl_results AS newer
-                  JOIN pages AS newer_page ON newer_page.page_id=newer.page_id
-                  WHERE newer_page.host_id=current_page.host_id
-                    AND newer.certificate_id IS NOT NULL
-                    AND newer.crawl_result_id < NEW.crawl_result_id
-                    AND newer.crawl_result_id > previous.crawl_result_id
-              )
               -- A rotation within the system-trusted PKIX ecosystem is expected
               -- and is not a TOFU alert. Enter/leave that ecosystem is.
-              AND (previous_certificate.pkix_verified=0 OR current_certificate.pkix_verified=0)
-            ORDER BY previous.crawl_result_id DESC
-            LIMIT 1;
+              AND (previous_certificate.pkix_verified=0 OR current_certificate.pkix_verified=0);
+
+            INSERT INTO host_certificate_state(host_id,crawl_result_id,certificate_id)
+            SELECT host_id,NEW.crawl_result_id,NEW.certificate_id
+            FROM pages WHERE page_id=NEW.page_id
+            ON CONFLICT(host_id) DO UPDATE SET
+                crawl_result_id=excluded.crawl_result_id,
+                certificate_id=excluded.certificate_id;
         END
     )sql");
     const auto pkix_backfill = writer_->execSqlSync(
@@ -448,15 +483,13 @@ void Catalog::open(bool recover_claims) {
         "('body_hash','blake2b-256'),('tls_validation','hostname-only')");
     // No work is in flight while a snapshot is being opened under the
     // crawler's exclusive lock. Claims left by a dead process are ready again.
-    if (recover_claims) {
-        writer_->execSqlSync(
-            "UPDATE crawl_queue SET state_code=0,claimed_at_unix_millis=NULL "
-            "WHERE state_code=1");
-        writer_->execSqlSync(
-            "UPDATE hosts SET next_queued_crawl_unix_millis=("
-            "SELECT min(ready_at_unix_millis) FROM crawl_queue "
-            "WHERE crawl_queue.host_id=hosts.host_id AND state_code=0)");
-    }
+    writer_->execSqlSync(
+        "UPDATE crawl_queue SET state_code=0,claimed_at_unix_millis=NULL "
+        "WHERE state_code=1");
+    writer_->execSqlSync(
+        "UPDATE hosts SET next_queued_crawl_unix_millis=("
+        "SELECT min(ready_at_unix_millis) FROM crawl_queue "
+        "WHERE crawl_queue.host_id=hosts.host_id AND state_code=0)");
 }
 
 drogon::Task<std::vector<CrawlResult>> Catalog::archive(std::string_view canonical_url, Use use,
@@ -1384,8 +1417,9 @@ drogon::Task<ProgressStats> Catalog::progress_stats() {
         throw std::logic_error("catalog is not open");
     const auto rows = co_await reader_->execSqlCoro(
         "SELECT (SELECT count(*) FROM pages) AS pages,"
-        "(SELECT count(*) FROM crawl_queue WHERE state_code=0) AS queued,"
-        "(SELECT count(*) FROM crawl_queue WHERE state_code=1) AS claimed");
+        "coalesce(sum(state_code=0),0) AS queued,"
+        "coalesce(sum(state_code=1),0) AS claimed "
+        "FROM crawl_queue INDEXED BY crawl_queue_ready");
     co_return ProgressStats{rows[0]["pages"].as<std::int64_t>(),
                             rows[0]["queued"].as<std::int64_t>(),
                             rows[0]["claimed"].as<std::int64_t>()};

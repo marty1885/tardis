@@ -743,7 +743,8 @@ int main(int argc, char** argv) {
             !std::filesystem::is_regular_file(cert_file) ||
             !std::filesystem::is_regular_file(key_file))
             throw std::invalid_argument("--cert and --key must name files");
-        tardis::Catalog catalog(archive, 4, 5000);
+        // Catalog::open(false) creates no writer client.
+        tardis::Catalog catalog(archive, 1, 5000);
         catalog.open(false);
         tardis::ObjectStore objects(archive, false);
         HomeController::configure(catalog);

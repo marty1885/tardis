@@ -237,8 +237,8 @@ class Catalog {
     Catalog(std::filesystem::path snapshot_dir, std::size_t read_connections,
             std::int64_t write_timeout_millis);
 
-    // A query server must pass false: only the crawler owner may recover
-    // abandoned queue claims on startup.
+    // A query server must pass false. It gets no writer client; schema
+    // maintenance, WAL setup, and claim recovery are crawler-owner work.
     void open(bool recover_claims = true);
 
     // Newest first. An absent cursor starts at the newest eligible capture.
