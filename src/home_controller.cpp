@@ -488,5 +488,5 @@ User-agent: *
 Disallow: /api
 Disallow: /archive
 )");
-    co_return resp;
+    reply(resp);
 }
