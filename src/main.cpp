@@ -172,12 +172,35 @@ std::string archive_navigation(const CrawlResult& result,
     return body;
 }
 
+bool same_page_version(const CrawlResult& left, const CrawlResult& right) {
+    const auto same_object = [&] {
+        if (left.object.has_value() != right.object.has_value()) return false;
+        return !left.object || left.object->blake2b_256 == right.object->blake2b_256;
+    };
+    return same_object() && left.redirected_to == right.redirected_to &&
+           left.redirect_count == right.redirect_count && left.status_code == right.status_code &&
+           left.meta == right.meta;
+}
+
+// Captures arrive newest first.  Walk them in capture order so an unchanged
+// run retains the first observation, then restore the order used by the page.
+std::vector<CrawlResult> update_timeline(const std::vector<CrawlResult>& captures) {
+    std::vector<CrawlResult> timeline;
+    timeline.reserve(captures.size());
+    for (auto capture = captures.rbegin(); capture != captures.rend(); ++capture) {
+        if (timeline.empty() || !same_page_version(timeline.back(), *capture))
+            timeline.push_back(*capture);
+    }
+    std::reverse(timeline.begin(), timeline.end());
+    return timeline;
+}
+
 drogon::HttpResponsePtr archive_history_response(
     std::string_view url, const std::vector<CrawlResult>& results) {
-    std::string body = "# Archive history\n\n> Archive of " + std::string(url) +
-                       "\n> " + std::to_string(results.size()) +
-                       " captured version" + (results.size() == 1 ? "" : "s") +
-                       ", newest first.\n\n";
+    std::string body = "# TARDIS Archive History\n"
+        "\n"
+        "=> " + std::string(url) + "\n"
+        "There are a total of  " + std::to_string(results.size()) + " unique version" + (results.size() == 1 ? "" : "s") + "\n\n";
     std::string year;
     std::string month;
     for (const auto& result : results) {
@@ -597,13 +620,22 @@ class ArchiveService : public std::enable_shared_from_this<ArchiveService> {
                     co_return;
                 }
                 if (selection == ArchiveSelection::history) {
-                    const auto results = co_await self->catalog_.archive(
-                        *url, Use::archiver, std::nullopt, 1000);
-                    if (results.empty()) {
+                    std::vector<CrawlResult> captures;
+                    std::optional<tardis::ArchiveCursor> before;
+                    for (;;) {
+                        auto page = co_await self->catalog_.archive(
+                            *url, Use::archiver, before, 1000);
+                        if (page.empty()) break;
+                        before = tardis::ArchiveCursor{page.back().started_at_unix_millis,
+                                                       page.back().crawl_result_id};
+                        captures.insert(captures.end(), page.begin(), page.end());
+                        if (page.size() < 1000) break;
+                    }
+                    if (captures.empty()) {
                         reply(error_response(drogon::k404NotFound, "no archived capture"));
                         co_return;
                     }
-                    reply(archive_history_response(*url, results));
+                    reply(archive_history_response(*url, update_timeline(captures)));
                     co_return;
                 }
                 if (selection == ArchiveSelection::capture) {

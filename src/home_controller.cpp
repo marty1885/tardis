@@ -487,6 +487,9 @@ R"(
 User-agent: *
 Disallow: /api
 Disallow: /archive
+Disallow: /known_feeds
+Disallow: /add_seed
+Disallow: /known_security_txt
 )");
     reply(resp);
 }
