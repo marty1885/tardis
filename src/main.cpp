@@ -294,27 +294,30 @@ std::string peer_fingerprint(const drogon::HttpRequestPtr& request);
 
 struct Paging {
     std::int64_t since{};
+    std::int64_t till{};
     std::string mode;
     std::string mime_filter;
     tardis::SinceCursor cursor;
 };
 
 std::optional<Paging> parse_token(std::string_view token) {
-    // p2.<since>.<mode>.<mime-filter-id>.<committed>.<result-id>
-    std::array<std::string_view, 6> parts;
+    // p3.<since>.<till>.<mode>.<mime-filter-id>.<committed>.<result-id>
+    std::array<std::string_view, 7> parts;
     for (auto& part : parts) {
         const auto dot = token.find('.');
         part = token.substr(0, dot);
         if (dot == std::string_view::npos) token = {};
         else token.remove_prefix(dot + 1);
     }
-    if (!token.empty() || parts[0] != "p2" || !mode(parts[2]) || parts[3].empty()) return std::nullopt;
+    if (!token.empty() || parts[0] != "p3" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
     const auto since = integer(parts[1]);
-    const auto committed = integer(parts[4]);
-    const auto id = integer(parts[5]);
-    if (!since || !committed || !id || *id <= 0 || *committed < *since)
+    const auto till = integer(parts[2]);
+    const auto committed = integer(parts[5]);
+    const auto id = integer(parts[6]);
+    if (!since || !till || *till < *since || !committed || !id || *id <= 0 ||
+        *committed < *since || *committed > *till)
         return std::nullopt;
-    return Paging{*since, std::string(parts[2]), std::string(parts[3]), {*committed, *id}};
+    return Paging{*since, *till, std::string(parts[3]), std::string(parts[4]), {*committed, *id}};
 }
 
 std::string mime_filter_id(const std::vector<std::string>& mime_types) {
@@ -344,9 +347,9 @@ std::optional<std::vector<std::string>> mime_filters(std::string_view encoded) {
     return result.empty() ? std::nullopt : std::optional{std::move(result)};
 }
 
-std::string token_for(std::int64_t since, std::string_view name, std::string_view filter_id,
+std::string token_for(std::int64_t since, std::int64_t till, std::string_view name, std::string_view filter_id,
                       const CrawlResult& result) {
-    return "p2." + std::to_string(since) + "." + std::string(name) + "." +
+    return "p3." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
            std::string(filter_id) + "." +
            std::to_string(result.committed_at_unix_millis) + "." +
            std::to_string(result.crawl_result_id);
@@ -405,23 +408,28 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
 
     void updates(const drogon::HttpRequestPtr& request,
                  std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                 std::string mode_name, std::int64_t since,
+                 std::string mode_name, std::int64_t since, std::int64_t till,
                  std::optional<std::string> page_token = std::nullopt,
                  std::optional<std::int64_t> limit_value = std::nullopt,
                  std::vector<std::string> mime_types = {}) {
         auto self = shared_from_this();
         drogon::async_run([self, request, reply = std::move(reply), mode_name = std::move(mode_name),
-                           since, page_token = std::move(page_token), limit_value,
+                           since, till, page_token = std::move(page_token), limit_value,
                            mime_types = std::move(mime_types)]() mutable
                               -> drogon::Task<void> {
             try {
+                if (till < since) {
+                    reply(error_response(drogon::k400BadRequest,
+                                         "till_unix_millis must be at least since_unix_millis"));
+                    co_return;
+                }
                 const auto use = co_await self->authorize(request, mode_name, reply);
                 if (!use) co_return;
                 const auto filter_id = mime_filter_id(mime_types);
                 tardis::SinceCursor cursor{since, 0};
                 if (page_token) {
                     const auto paging = parse_token(*page_token);
-                    if (!paging || paging->since != since || paging->mode != mode_name ||
+                    if (!paging || paging->since != since || paging->till != till || paging->mode != mode_name ||
                         paging->mime_filter != filter_id) {
                         reply(error_response(drogon::k400BadRequest, "invalid paging token"));
                         co_return;
@@ -436,12 +444,13 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     }
                     limit = static_cast<std::size_t>(*limit_value);
                 }
-                auto results = co_await self->catalog_.since(cursor, *use, limit + 1, mime_types);
+                auto results = co_await self->catalog_.since(cursor, till, *use, limit + 1, mime_types);
                 const bool more = results.size() > limit;
                 if (more) results.pop_back();
                 Json::Value body(Json::objectValue);
                 body["mode"] = mode_name;
                 body["since_unix_millis"] = Json::Int64(since);
+                body["till_unix_millis"] = Json::Int64(till);
                 Json::Value items(Json::arrayValue);
                 for (const auto& result : results) {
                     auto item = metadata(result);
@@ -453,10 +462,10 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 body["results"] = std::move(items);
                 body["has_more"] = more;
                 if (!results.empty())
-                    body["resume_token"] = token_for(since, mode_name, filter_id, results.back());
+                    body["resume_token"] = token_for(since, till, mode_name, filter_id, results.back());
                 else if (page_token) body["resume_token"] = *page_token;
                 else body["resume_token"] = Json::nullValue;
-                if (more) body["next_page_token"] = token_for(since, mode_name, filter_id, results.back());
+                if (more) body["next_page_token"] = token_for(since, till, mode_name, filter_id, results.back());
                 else body["next_page_token"] = Json::nullValue;
                 reply(json_response(std::move(body)));
             } catch (const std::exception& error) {
@@ -795,18 +804,19 @@ int main(int argc, char** argv) {
         const auto api_updates = [api_service](const drogon::HttpRequestPtr& request,
                                                std::function<void(const drogon::HttpResponsePtr&)>&& reply,
                                                const std::string& mode_name, std::int64_t since,
+                                               std::int64_t till,
                                                std::optional<std::string> page_token = std::nullopt,
                                                std::optional<std::int64_t> limit = std::nullopt,
                                                std::vector<std::string> mime_types = {}) {
-            api_service->updates(request, std::move(reply), mode_name, since,
+            api_service->updates(request, std::move(reply), mode_name, since, till,
                                  std::move(page_token), limit, std::move(mime_types));
         };
         drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}",
+            "/api/v1/updates/{mode}/{since}/{till}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                          const std::string& mode_name, std::int64_t since) {
-                api_updates(request, std::move(reply), mode_name, since);
+                          const std::string& mode_name, std::int64_t since, std::int64_t till) {
+                api_updates(request, std::move(reply), mode_name, since, till);
             }, {drogon::Get});
         drogon::app().registerHandler(
             "/api/v1/known-feeds/{mode}",
@@ -823,20 +833,20 @@ int main(int argc, char** argv) {
                 api_service->known_security_txt(request, std::move(reply), mode_name);
             }, {drogon::Get});
         drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{option}/{value}",
+            "/api/v1/updates/{mode}/{since}/{till}/{option}/{value}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                          const std::string& mode_name, std::int64_t since,
+                          const std::string& mode_name, std::int64_t since, std::int64_t till,
                           const std::string& option, const std::string& value) {
                 if (option == "page") {
-                    api_updates(request, std::move(reply), mode_name, since, value);
+                    api_updates(request, std::move(reply), mode_name, since, till, value);
                 } else if (option == "limit") {
                     const auto limit = integer(value);
-                    if (limit) api_updates(request, std::move(reply), mode_name, since, std::nullopt, *limit);
+                    if (limit) api_updates(request, std::move(reply), mode_name, since, till, std::nullopt, *limit);
                     else reply(error_response(drogon::k400BadRequest, "limit must be an integer"));
                 } else if (option == "mime") {
                     const auto filters = mime_filters(value);
-                    if (filters) api_updates(request, std::move(reply), mode_name, since,
+                    if (filters) api_updates(request, std::move(reply), mode_name, since, till,
                                              std::nullopt, std::nullopt, *filters);
                     else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
                 } else {
@@ -844,26 +854,26 @@ int main(int argc, char** argv) {
                 }
             }, {drogon::Get});
         drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{first}/{second}/{third}/{fourth}",
+            "/api/v1/updates/{mode}/{since}/{till}/{first}/{second}/{third}/{fourth}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                          const std::string& mode_name, std::int64_t since,
+                          const std::string& mode_name, std::int64_t since, std::int64_t till,
                           const std::string& first, const std::string& second,
                           const std::string& third, const std::string& fourth) {
                 if (first == "page" && third == "limit") {
                     const auto limit = integer(fourth);
-                    if (limit) api_updates(request, std::move(reply), mode_name, since, second, *limit);
+                    if (limit) api_updates(request, std::move(reply), mode_name, since, till, second, *limit);
                     else reply(error_response(drogon::k400BadRequest, "limit must be an integer"));
                 } else if (first == "mime") {
                     const auto filters = mime_filters(second);
                     if (!filters) {
                         reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
                     } else if (third == "page") {
-                        api_updates(request, std::move(reply), mode_name, since, fourth,
+                        api_updates(request, std::move(reply), mode_name, since, till, fourth,
                                     std::nullopt, *filters);
                     } else if (third == "limit") {
                         const auto limit = integer(fourth);
-                        if (limit) api_updates(request, std::move(reply), mode_name, since,
+                        if (limit) api_updates(request, std::move(reply), mode_name, since, till,
                                                std::nullopt, *limit, *filters);
                         else reply(error_response(drogon::k400BadRequest, "limit must be an integer"));
                     } else {
@@ -874,14 +884,14 @@ int main(int argc, char** argv) {
                 }
             }, {drogon::Get});
         drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/mime/{filters}/page/{token}/limit/{limit}",
+            "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/page/{token}/limit/{limit}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                          const std::string& mode_name, std::int64_t since,
+                          const std::string& mode_name, std::int64_t since, std::int64_t till,
                           const std::string& filters_text, const std::string& token,
                           std::int64_t limit) {
                 const auto filters = mime_filters(filters_text);
-                if (filters) api_updates(request, std::move(reply), mode_name, since,
+                if (filters) api_updates(request, std::move(reply), mode_name, since, till,
                                          token, limit, *filters);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});

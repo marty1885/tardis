@@ -261,8 +261,10 @@ class Catalog {
     drogon::Task<std::optional<CrawlResult>> capture(std::string_view canonical_url,
                                                      std::int64_t crawl_result_id, Use use);
 
-    // Oldest first, with an exclusive stable cursor suitable for resumption.
-    drogon::Task<std::vector<CrawlResult>> since(SinceCursor after, Use use,
+    // Oldest first within (after, through], with an exclusive stable cursor
+    // suitable for resumption.
+    drogon::Task<std::vector<CrawlResult>> since(SinceCursor after,
+                                                 std::int64_t through_unix_millis, Use use,
                                                  std::size_t limit = 1000,
                                                  const std::vector<std::string>& mime_types = {});
 

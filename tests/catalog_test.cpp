@@ -81,10 +81,13 @@ int main() {
             1));
         assert(second_page.size() == 1 && second_page[0].crawl_result_id == 1);
 
-        const auto feed = drogon::sync_wait(catalog.since({1100, 1}, tardis::Use::archiver));
+        const auto feed = drogon::sync_wait(catalog.since({1100, 1}, 1500, tardis::Use::archiver));
         assert(feed.size() == 1 && feed[0].crawl_result_id == 3);
+        const auto bounded_feed = drogon::sync_wait(catalog.since(
+            {0, 0}, 1400, tardis::Use::archiver));
+        assert(bounded_feed.size() == 1 && bounded_feed[0].crawl_result_id == 1);
         const auto filtered = drogon::sync_wait(catalog.since(
-            {0, 0}, tardis::Use::tlgs, 100, {"text/gemini"}));
+            {0, 0}, 1500, tardis::Use::tlgs, 100, {"text/gemini"}));
         assert(filtered.size() == 1 && filtered[0].crawl_result_id == 2);
         assert(filtered[0].redirected_to &&
                *filtered[0].redirected_to == "gemini://example.org/next");

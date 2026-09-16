@@ -236,12 +236,41 @@ TARDIS provides a Gemini API for archive retrieval and incremental index updates
 
 Archive retrieval, incremental updates, and mode-specific feed listings are available only over Gemini with a client certificate. A client certificate is authorized by its SHA-256 fingerprint and the virtual crawler modes assigned to it. No certificate returns 60; an unrecognized, revoked, or mode-denied certificate returns 61. HTTP requests cannot carry this Gemini certificate and therefore return 403 on those protected routes. The public /api/v1/known_feeds route is also available over HTTP.
 
-There is currently no public/self served API sign up. Please send an message along with your client certificate's SHA-256 fingerprint to the author for access:
+There is currently no self served API sign up. Please send an message along with your client certificate's SHA-256 fingerprint to the author for access to the non-public endpoints:
 
 => mailto://martin@clehaxze.tw The author's email address (martin \at clehaxze.tw)
 => misfin://martin@clehaxze.tw The author's Misfin mail (misfin://martin@clehaxze.tw)
 
-## Retrieve of archive
+## Public APIs
+
+Public APIs are accessable for all without a registered client certificate.
+
+### Known feeds
+
+The public /api/v1/known_feeds route mirrors /known_feeds for archiver-visible feeds and returns JSON. Set the query parameter to one use the supported feed types to query feeds known to the crawler.
+
+```example Gemini request for querying known feeds
+/api/v1/known_feeds?gemsub
+```
+
+Which returns:
+
+```example response for known Gemsub
+["gemini://example.com/", "gemini://example.org/"]
+```
+
+Supported feed types:
+
+* gemsub
+* atom
+* rss
+* twtxt
+
+## Private APIs
+
+You do need a registered certificate for them:
+
+### Retrieve of archive
 
 ```format for retreving arvhice
 /api/v1/retrieve/{latest|as_of_unix_millis}/{mode}/x/gemini/{authority_and_path}/param/{query}
@@ -263,20 +292,20 @@ Mode is one of one of the following. URL components are percent-encoded path par
 * tlgs
 * webproxy
 
-## Incremental updates
+### Incremental updates
 
 ```format for incremental updates
-/api/v1/updates/{mode}/{since_unix_millis}[/mime/{mime_types}][/page/{paging_token}][/limit/{page_size}]
+/api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}[/mime/{mime_types}][/page/{paging_token}][/limit/{page_size}]
 ```
 
-This returns JSON crawl-result events, oldest first, after the supplied Unix millisecond cursor. It is designed for search engines to update an index without recrawling Gemini. Results contain metadata, URLs, and body_base64 whenever an archived body exists. Limit defaults to 100 and accepts 1 through 1000.
+This returns JSON crawl-result events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged update run stable while new crawl results arrive. It is designed for search engines to update an index without recrawling Gemini. Results contain metadata, URLs, and body_base64 whenever an archived body exists. Limit defaults to 100 and accepts 1 through 1000.
 
 The optional mime_types segment is a percent-encoded comma-separated list of MIME types. It filters body results before paging, so a text-only indexer does not download PDF bodies it will not index. Redirect results with a resolved target are always included so an indexer can update URL mappings. These events include status_code, url, and redirected_to, even when the target page was crawled earlier.
 
 Example MIME filter:
 
 ```example with MIME filer
-/api/v1/updates/archive/0/mime/text%2Fgemini%2Ctext%2Fplain
+/api/v1/updates/archive/0/1767225800000/mime/text%2Fgemini%2Ctext%2Fplain
 ```
 
 Example response:
@@ -285,6 +314,7 @@ Example response:
 {
   "mode": "archive",
   "since_unix_millis": 1767225600000,
+  "till_unix_millis": 1767225800000,
   "results": [{
     "crawl_result_id": 42,
     "url": "gemini://example.org/notes.gmi",
@@ -298,35 +328,14 @@ Example response:
     "body_base64": "SGVsbG8sIEdlbWluaSEK"
   }],
   "has_more": true,
-  "next_page_token": "p2.1767225600000.archive.7d18a49894551b6c.1767225700456.42",
-  "resume_token": "p2.1767225600000.archive.7d18a49894551b6c.1767225700456.42"
+  "next_page_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42",
+  "resume_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42"
 }
 ```
 
-You can follow next_page_token while has_more is true. Persist resume_token only after processing a page; send it in /page/ on the next poll. Paging tokens are bound to the original mode and since timestamp.
+You can follow next_page_token while has_more is true. Persist resume_token only after processing a page; send it in /page/ on the next poll. Paging tokens are bound to the original mode, since timestamp, and till timestamp.
 
 Invalid parameters or tokens return 59.
-
-## Known feeds
-
-The public /api/v1/known_feeds route mirrors /known_feeds for archiver-visible feeds and returns JSON. Set the query parameter to one use the supported feed types to query feeds known to the crawler.
-
-```example Gemini request for querying known feeds
-/api/v1/known_feeds?gemsub
-```
-
-Which returns:
-
-```example response for known Gemsub
-["gemini://example.com/", "gemini://example.org/"]
-```
-
-Supported feed types:
-
-* gemsub
-* atom
-* rss
-* twtxt
 
 )gemini"));
 }

@@ -501,7 +501,8 @@ LIMIT 1)sql";
     co_return neighbors;
 }
 
-drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after, Use use,
+drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after,
+                                                      std::int64_t through_unix_millis, Use use,
                                                       std::size_t limit,
                                                       const std::vector<std::string>& mime_types) {
     if (!reader_)
@@ -511,6 +512,7 @@ drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after, Use use
 WHERE (cr.committed_at_unix_millis > ? OR
        (cr.committed_at_unix_millis = ? AND cr.crawl_result_id > ?))
   AND (cr.robots_bitfield & ?) != 0
+  AND cr.committed_at_unix_millis <= ?
 )sql";
     if (!mime_types.empty()) {
         sql += " AND ((cr.status_code BETWEEN 30 AND 39 AND "
@@ -528,7 +530,7 @@ ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
     const auto rows = co_await reader_->execSqlCoro(
         sql, after.committed_at_unix_millis, after.committed_at_unix_millis, after.crawl_result_id,
-        use_bit(use), static_cast<std::int64_t>(limit));
+        use_bit(use), through_unix_millis, static_cast<std::int64_t>(limit));
     std::vector<CrawlResult> results;
     results.reserve(rows.size());
     for (const auto& row : rows) results.push_back(decode_result(row));
