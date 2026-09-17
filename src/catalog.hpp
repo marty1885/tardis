@@ -191,6 +191,15 @@ struct CatalogStats {
     std::int64_t archive_objects{};
 };
 
+// Archive-wide counters are maintained by the catalog transaction that inserts
+// a crawl result. Unlike CatalogStats, this is safe to use on a request path.
+struct ArchiveStatistics {
+    std::int64_t archived_pages{};
+    std::int64_t uncompressed_archive_bytes{};
+    std::int64_t archive_hosts{};
+    std::int64_t archive_objects{};
+};
+
 // The crawler's progress display needs only these counters. Keep expensive
 // archive-wide aggregates out of its hot path.
 struct ProgressStats {
@@ -318,6 +327,7 @@ class Catalog {
     drogon::Task<std::optional<std::int64_t>> next_ready_unix_millis();
     drogon::Task<std::optional<std::int64_t>> next_watch_unix_millis();
     drogon::Task<ProgressStats> progress_stats();
+    drogon::Task<ArchiveStatistics> archive_statistics();
     drogon::Task<CatalogStats> stats();
     drogon::Task<std::vector<CertificateChange>> certificate_changes();
     drogon::Task<std::vector<KnownFeed>> known_feeds(

@@ -378,7 +378,7 @@ The WARC record payload is the original raw body bytes. A client must zstd-decom
 
 drogon::Task<drogon::HttpResponsePtr> HomeController::statistics(drogon::HttpRequestPtr) {
     if (!catalog_) throw std::logic_error("HomeController is not configured");
-    const auto stats = co_await catalog_->stats();
+    const auto stats = co_await catalog_->archive_statistics();
     co_return gemini_document(
         "# TARDIS statistics\n"
         "\n"

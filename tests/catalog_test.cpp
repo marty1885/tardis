@@ -56,6 +56,13 @@ int main() {
         )sql");
         sqlite3_close(db);
 
+        const auto fixture_archive_statistics =
+            drogon::sync_wait(catalog.archive_statistics());
+        assert(fixture_archive_statistics.archived_pages == 1);
+        assert(fixture_archive_statistics.uncompressed_archive_bytes == 24);
+        assert(fixture_archive_statistics.archive_hosts == 1);
+        assert(fixture_archive_statistics.archive_objects == 1);
+
         const auto history =
             drogon::sync_wait(catalog.archive("gemini://example.org/", tardis::Use::archiver));
         assert(history.size() == 2);
@@ -131,6 +138,12 @@ int main() {
         assert(with_appended[0].object && with_appended[0].object->raw_bytes == 42);
         assert(with_appended[0].certificate &&
                with_appended[0].certificate->bytes == certificate.bytes);
+        const auto appended_archive_statistics =
+            drogon::sync_wait(catalog.archive_statistics());
+        assert(appended_archive_statistics.archived_pages == 1);
+        assert(appended_archive_statistics.uncompressed_archive_bytes == 66);
+        assert(appended_archive_statistics.archive_hosts == 1);
+        assert(appended_archive_statistics.archive_objects == 2);
         sqlite3* changes_db = nullptr;
         assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &changes_db) == SQLITE_OK);
         sqlite3_stmt* change = nullptr;
@@ -210,6 +223,12 @@ int main() {
         const auto published = drogon::sync_wait(
             catalog.archive(watched_page.url, tardis::Use::archiver));
         assert(published.size() == 1 && published[0].crawl_result_id == 5);
+        const auto published_archive_statistics =
+            drogon::sync_wait(catalog.archive_statistics());
+        assert(published_archive_statistics.archived_pages == 2);
+        assert(published_archive_statistics.uncompressed_archive_bytes == 66);
+        assert(published_archive_statistics.archive_hosts == 1);
+        assert(published_archive_statistics.archive_objects == 2);
 
         // Discovery never turns an already archived page into recurring work.
         const auto discovered_claim = drogon::sync_wait(catalog.claim(test_now + 10'000, 0));
@@ -364,12 +383,30 @@ int main() {
         assert(sqlite3_step(suppressed) == SQLITE_DONE);
         sqlite3_finalize(suppressed);
         sqlite3_close(pkix_db);
+
+        // Emulate an archive created before archive_statistics_v1. The next
+        // crawler-owned open must rebuild exact counters from crawl history.
+        assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &db) == SQLITE_OK);
+        exec(db, R"sql(
+            DELETE FROM archive_statistics;
+            DELETE FROM archived_pages;
+            DELETE FROM archived_hosts;
+            DELETE FROM archived_objects;
+            DELETE FROM snapshot_meta WHERE key='archive_statistics_v1';
+        )sql");
+        sqlite3_close(db);
     }
     {
         tardis::Catalog recovered(snapshot, 1, 5000);
         recovered.open();
         const auto recovered_stats = drogon::sync_wait(recovered.stats());
         assert(recovered_stats.claimed == 0 && recovered_stats.queued == 1);
+        const auto recovered_archive_statistics =
+            drogon::sync_wait(recovered.archive_statistics());
+        assert(recovered_archive_statistics.archived_pages == 5);
+        assert(recovered_archive_statistics.uncompressed_archive_bytes == 108);
+        assert(recovered_archive_statistics.archive_hosts == 1);
+        assert(recovered_archive_statistics.archive_objects == 2);
         const tardis::PageAddress seed_page{"gemini://example.org/seed", "example.org"};
         assert(drogon::sync_wait(recovered.enqueue_seed_if_uncrawled(
             seed_page, std::numeric_limits<std::int64_t>::max())));

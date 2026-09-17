@@ -306,6 +306,22 @@ void Catalog::open(bool recover_claims) {
         R"sql(CREATE INDEX IF NOT EXISTS crawl_results_since
             ON crawl_results(committed_at_unix_millis, crawl_result_id,
                              robots_bitfield))sql",
+        R"sql(CREATE TABLE IF NOT EXISTS archive_statistics (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            archived_pages INTEGER NOT NULL CHECK(archived_pages >= 0),
+            uncompressed_archive_bytes INTEGER NOT NULL CHECK(uncompressed_archive_bytes >= 0),
+            archive_hosts INTEGER NOT NULL CHECK(archive_hosts >= 0),
+            archive_objects INTEGER NOT NULL CHECK(archive_objects >= 0)
+        ) STRICT)sql",
+        R"sql(CREATE TABLE IF NOT EXISTS archived_pages (
+            page_id INTEGER PRIMARY KEY REFERENCES pages(page_id)
+        ) STRICT)sql",
+        R"sql(CREATE TABLE IF NOT EXISTS archived_hosts (
+            host_id INTEGER PRIMARY KEY REFERENCES hosts(host_id)
+        ) STRICT)sql",
+        R"sql(CREATE TABLE IF NOT EXISTS archived_objects (
+            object_id INTEGER PRIMARY KEY REFERENCES objects(object_id)
+        ) STRICT)sql",
         R"sql(CREATE INDEX IF NOT EXISTS hosts_ready
             ON hosts(ready_after_unix_millis, host_id)
             WHERE status_code = 0 AND next_queued_crawl_unix_millis IS NOT NULL)sql",
@@ -376,6 +392,74 @@ void Catalog::open(bool recover_claims) {
         writer_->execSqlSync(
             "ALTER TABLE certificates ADD COLUMN pkix_verified INTEGER NOT NULL DEFAULT 0 "
             "CHECK(pkix_verified IN (0,1))");
+    // These counters are append-only, like crawl_results. The membership
+    // tables preserve the DISTINCT semantics of the old statistics query.
+    writer_->execSqlSync("DROP TRIGGER IF EXISTS record_archive_statistics");
+    writer_->execSqlSync(R"sql(
+        CREATE TRIGGER record_archive_statistics
+        AFTER INSERT ON crawl_results
+        WHEN (NEW.robots_bitfield & 4) != 0
+        BEGIN
+            INSERT OR IGNORE INTO archived_pages(page_id) VALUES(NEW.page_id);
+            UPDATE archive_statistics
+            SET archived_pages=archived_pages+changes() WHERE singleton=1;
+
+            INSERT OR IGNORE INTO archived_hosts(host_id)
+            SELECT host_id FROM pages WHERE page_id=NEW.page_id;
+            UPDATE archive_statistics
+            SET archive_hosts=archive_hosts+changes() WHERE singleton=1;
+
+            UPDATE archive_statistics
+            SET uncompressed_archive_bytes=uncompressed_archive_bytes+
+                coalesce((SELECT raw_bytes FROM objects WHERE object_id=NEW.object_id),0)
+            WHERE singleton=1;
+
+            INSERT OR IGNORE INTO archived_objects(object_id)
+            SELECT NEW.object_id WHERE NEW.object_id IS NOT NULL;
+            UPDATE archive_statistics
+            SET archive_objects=archive_objects+changes() WHERE singleton=1;
+        END
+    )sql");
+    const auto archive_statistics_backfill = writer_->execSqlSync(
+        "SELECT 1 FROM snapshot_meta WHERE key='archive_statistics_v1' LIMIT 1");
+    if (archive_statistics_backfill.empty()) {
+        writer_->execSqlSync("BEGIN IMMEDIATE");
+        try {
+            // An interrupted first migration leaves no marker. Clear any
+            // partial work and rebuild from the authoritative crawl history.
+            writer_->execSqlSync("DELETE FROM archive_statistics");
+            writer_->execSqlSync("DELETE FROM archived_pages");
+            writer_->execSqlSync("DELETE FROM archived_hosts");
+            writer_->execSqlSync("DELETE FROM archived_objects");
+            writer_->execSqlSync(
+                "INSERT INTO archived_pages(page_id) "
+                "SELECT DISTINCT page_id FROM crawl_results "
+                "WHERE (robots_bitfield & 4) != 0");
+            writer_->execSqlSync(
+                "INSERT INTO archived_hosts(host_id) "
+                "SELECT DISTINCT p.host_id FROM archived_pages AS ap "
+                "JOIN pages AS p ON p.page_id=ap.page_id");
+            writer_->execSqlSync(
+                "INSERT INTO archived_objects(object_id) "
+                "SELECT DISTINCT object_id FROM crawl_results "
+                "WHERE object_id IS NOT NULL AND (robots_bitfield & 4) != 0");
+            writer_->execSqlSync(
+                "INSERT INTO archive_statistics("
+                "singleton,archived_pages,uncompressed_archive_bytes,archive_hosts,archive_objects) "
+                "VALUES(1,(SELECT count(*) FROM archived_pages),"
+                "(SELECT coalesce(sum(o.raw_bytes),0) FROM crawl_results AS cr "
+                "JOIN objects AS o ON o.object_id=cr.object_id "
+                "WHERE (cr.robots_bitfield & 4) != 0),"
+                "(SELECT count(*) FROM archived_hosts),(SELECT count(*) FROM archived_objects))");
+            writer_->execSqlSync(
+                "INSERT INTO snapshot_meta(key,value) VALUES"
+                "('archive_statistics_v1','complete')");
+            writer_->execSqlSync("COMMIT");
+        } catch (...) {
+            writer_->execSqlSync("ROLLBACK");
+            throw;
+        }
+    }
     // Keep the last certificate observation per host as materialized state.
     // Deriving it inside the insert trigger used to perform a correlated scan
     // over crawl_results for every candidate predecessor, making inserts
@@ -1468,16 +1552,27 @@ drogon::Task<std::optional<std::int64_t>> Catalog::next_watch_unix_millis() {
     co_return rows[0]["ready"].as<std::int64_t>();
 }
 
-drogon::Task<CatalogStats> Catalog::stats() {
+drogon::Task<ArchiveStatistics> Catalog::archive_statistics() {
     if (!reader_)
         throw std::logic_error("catalog is not open");
+    const auto migrated = co_await reader_->execSqlCoro(
+        "SELECT 1 FROM snapshot_meta WHERE key='archive_statistics_v1' LIMIT 1");
+    if (!migrated.empty()) {
+        const auto rows = co_await reader_->execSqlCoro(
+            "SELECT archived_pages,uncompressed_archive_bytes,archive_hosts,archive_objects "
+            "FROM archive_statistics WHERE singleton=1");
+        if (rows.size() != 1)
+            throw std::runtime_error("archive statistics migration is incomplete");
+        co_return ArchiveStatistics{rows[0]["archived_pages"].as<std::int64_t>(),
+                                    rows[0]["uncompressed_archive_bytes"].as<std::int64_t>(),
+                                    rows[0]["archive_hosts"].as<std::int64_t>(),
+                                    rows[0]["archive_objects"].as<std::int64_t>()};
+    }
+    // A newly deployed server can still serve an archive that has not yet
+    // been opened by the crawler version carrying the migration.
     const auto rows = co_await reader_->execSqlCoro(
-        "SELECT (SELECT count(*) FROM pages) AS pages,"
-        "(SELECT count(*) FROM crawl_queue WHERE state_code=0) AS queued,"
-        "(SELECT count(*) FROM crawl_queue WHERE state_code=1) AS claimed,"
-        "(SELECT count(*) FROM crawl_results) AS crawl_results,"
-        "(SELECT count(*) FROM objects) AS objects,"
-        "(SELECT count(DISTINCT page_id) FROM crawl_results WHERE (robots_bitfield & ?) != 0) AS archived_pages,"
+        "SELECT (SELECT count(DISTINCT page_id) FROM crawl_results "
+        "WHERE (robots_bitfield & ?) != 0) AS archived_pages,"
         "(SELECT coalesce(sum(o.raw_bytes),0) FROM crawl_results AS cr JOIN objects AS o ON o.object_id=cr.object_id "
         "WHERE (cr.robots_bitfield & ?) != 0) AS uncompressed_archive_bytes,"
         "(SELECT count(DISTINCT p.host_id) FROM crawl_results AS cr JOIN pages AS p ON p.page_id=cr.page_id "
@@ -1486,16 +1581,32 @@ drogon::Task<CatalogStats> Catalog::stats() {
         "AND (robots_bitfield & ?) != 0) AS archive_objects",
         use_bit(Use::archiver), use_bit(Use::archiver), use_bit(Use::archiver),
         use_bit(Use::archiver));
+    co_return ArchiveStatistics{rows[0]["archived_pages"].as<std::int64_t>(),
+                                rows[0]["uncompressed_archive_bytes"].as<std::int64_t>(),
+                                rows[0]["archive_hosts"].as<std::int64_t>(),
+                                rows[0]["archive_objects"].as<std::int64_t>()};
+}
+
+drogon::Task<CatalogStats> Catalog::stats() {
+    if (!reader_)
+        throw std::logic_error("catalog is not open");
+    const auto rows = co_await reader_->execSqlCoro(
+        "SELECT (SELECT count(*) FROM pages) AS pages,"
+        "(SELECT count(*) FROM crawl_queue WHERE state_code=0) AS queued,"
+        "(SELECT count(*) FROM crawl_queue WHERE state_code=1) AS claimed,"
+        "(SELECT count(*) FROM crawl_results) AS crawl_results,"
+        "(SELECT count(*) FROM objects) AS objects");
+    const auto archive = co_await archive_statistics();
     CatalogStats result;
     result.pages = rows[0]["pages"].as<std::int64_t>();
     result.queued = rows[0]["queued"].as<std::int64_t>();
     result.claimed = rows[0]["claimed"].as<std::int64_t>();
     result.crawl_results = rows[0]["crawl_results"].as<std::int64_t>();
     result.objects = rows[0]["objects"].as<std::int64_t>();
-    result.archived_pages = rows[0]["archived_pages"].as<std::int64_t>();
-    result.uncompressed_archive_bytes = rows[0]["uncompressed_archive_bytes"].as<std::int64_t>();
-    result.archive_hosts = rows[0]["archive_hosts"].as<std::int64_t>();
-    result.archive_objects = rows[0]["archive_objects"].as<std::int64_t>();
+    result.archived_pages = archive.archived_pages;
+    result.uncompressed_archive_bytes = archive.uncompressed_archive_bytes;
+    result.archive_hosts = archive.archive_hosts;
+    result.archive_objects = archive.archive_objects;
     co_return result;
 }
 
