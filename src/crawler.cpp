@@ -1270,12 +1270,10 @@ drogon::Task<void> Crawler::run() {
         });
     co_await report_progress("starting");
     while (!stop_requested_) {
-        // Do not let a burst of newly recognized automatic targets delay
-        // ordinary discovery work.  In particular, one security.txt target
-        // per newly seen host can otherwise monopolize the writer before the
-        // already queued URLs have their first crawl.
-        if (!co_await catalog_.next_ready_unix_millis())
-            co_await enqueue_due_watches();
+        // Enqueue one due automatic target per dispatch round.  This makes
+        // periodic work progress during a large initial crawl without letting
+        // a burst of newly recognized targets monopolize the writer.
+        co_await enqueue_due_watches();
         dispatch_worker();
         while (active_workers_.load(std::memory_order_acquire))
             co_await wait_for_workers();
