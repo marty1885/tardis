@@ -115,7 +115,7 @@ if(BUILD_TESTING)
                             src/archive_link_rewrite.cpp
                             src/object_store.cpp src/ssrf.cpp)
   target_include_directories(tardis_unit PRIVATE src ${SQLite3_INCLUDE_DIRS})
-  target_link_libraries(tardis_unit PRIVATE dremini tlgs_url Drogon::Drogon ${SQLite3_LIBRARIES}
+  target_link_libraries(tardis_unit PRIVATE dremini tlgs_url tardis_api_clients Drogon::Drogon ${SQLite3_LIBRARIES}
                                            tardis_catalog ${ZSTD_LIBRARY} ${SODIUM_LIBRARY}
                                            OpenSSL::Crypto pugixml::pugixml ${CMAKE_DL_LIBS})
   add_test(NAME tardis_unit COMMAND tardis_unit)

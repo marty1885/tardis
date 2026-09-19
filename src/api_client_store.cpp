@@ -5,6 +5,7 @@
 #include <openssl/x509.h>
 
 #include <array>
+#include <cctype>
 #include <cstdio>
 #include <stdexcept>
 
@@ -22,6 +23,28 @@ std::string format_fingerprint(const unsigned char* bytes, unsigned int count) {
 }
 }  // namespace
 
+std::string normalize_certificate_fingerprint(std::string_view fingerprint) {
+    std::string hex;
+    hex.reserve(64);
+    for (const unsigned char character : fingerprint) {
+        if (character == ':') continue;
+        if (!std::isxdigit(character))
+            throw std::invalid_argument("certificate fingerprint must be SHA-256 hex");
+        hex += static_cast<char>(std::toupper(character));
+    }
+    if (hex.size() != 64)
+        throw std::invalid_argument("certificate fingerprint must contain 64 hexadecimal digits");
+
+    std::string result;
+    result.reserve(95);
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        if (i) result += ':';
+        result += hex[i];
+        result += hex[i + 1];
+    }
+    return result;
+}
+
 std::string certificate_fingerprint(const std::filesystem::path& pem_file) {
     std::unique_ptr<FILE, decltype(&std::fclose)> file(std::fopen(pem_file.c_str(), "rb"),
                                                        &std::fclose);
@@ -33,7 +56,7 @@ std::string certificate_fingerprint(const std::filesystem::path& pem_file) {
     unsigned int count{};
     if (X509_digest(certificate.get(), EVP_sha256(), hash.data(), &count) != 1 || count != 32)
         throw std::runtime_error("cannot fingerprint client certificate");
-    return format_fingerprint(hash.data(), count);
+    return normalize_certificate_fingerprint(format_fingerprint(hash.data(), count));
 }
 
 ApiClientStore::ApiClientStore(const std::filesystem::path& database_path) {
@@ -61,15 +84,16 @@ drogon::Task<void> ApiClientStore::open() {
 drogon::Task<std::int64_t> ApiClientStore::add(std::string_view label,
                                                std::string_view fingerprint,
                                                std::uint16_t modes) {
-    if (label.empty() || fingerprint.size() != 95 || !modes || modes > 31)
+    if (label.empty() || !modes || modes > 31)
         throw std::invalid_argument("label, certificate fingerprint, and modes are required");
+    const auto canonical_fingerprint = normalize_certificate_fingerprint(fingerprint);
     co_await db_->execSqlCoro(
         "INSERT INTO api_clients(label,fingerprint,modes) VALUES(?,?,?) "
         "ON CONFLICT(fingerprint) DO UPDATE SET label=excluded.label,"
         "modes=excluded.modes,revoked=0",
-        std::string(label), std::string(fingerprint), modes);
+        std::string(label), canonical_fingerprint, modes);
     const auto rows = co_await db_->execSqlCoro(
-        "SELECT client_id FROM api_clients WHERE fingerprint=?", std::string(fingerprint));
+        "SELECT client_id FROM api_clients WHERE fingerprint=?", canonical_fingerprint);
     if (rows.empty()) throw std::runtime_error("failed to add API client");
     co_return rows[0]["client_id"].as<std::int64_t>();
 }

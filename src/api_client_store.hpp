@@ -38,6 +38,10 @@ class ApiClientStore {
     drogon::orm::DbClientPtr db_;
 };
 
+// SHA-256 fingerprint in Trantor's uppercase colon-separated representation.
+// Accepts either 64 hexadecimal digits or the colon-separated form.
+std::string normalize_certificate_fingerprint(std::string_view fingerprint);
+
 // Fingerprint of the first PEM certificate in a file, in Trantor's
 // uppercase colon-separated SHA-256 representation.
 std::string certificate_fingerprint(const std::filesystem::path& pem_file);

@@ -770,6 +770,11 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 archive* writer = archive_write_new();
                 if (!writer) throw std::runtime_error("cannot allocate WARC writer");
                 try {
+                    // libarchive otherwise pads its output to 10 KiB after the
+                    // zstd filter has finalized, leaving raw bytes after the
+                    // compressed frame.
+                    archive_check(archive_write_set_bytes_per_block(writer, 1), writer,
+                                  "disable WARC output block padding");
                     archive_check(archive_write_add_filter_zstd(writer), writer, "enable WARC zstd compression");
                     archive_check(archive_write_set_format_warc(writer), writer, "select WARC format");
                     archive_check(archive_write_open(writer, &output, archive_open, archive_write, archive_close),
@@ -1046,7 +1051,7 @@ void usage() {
     std::cout << "Usage:\n"
               << "  tardis serve --archive DIR --clients-db FILE --cert SERVER.pem --key SERVER.key"
                  " [--listen IP] [--port GEMINI_PORT] [--http-port HTTP_PORT]\n"
-              << "  tardis client add --clients-db FILE --cert CLIENT.pem --label LABEL"
+              << "  tardis client add --clients-db FILE (--cert CLIENT.pem | --fingerprint SHA256) --label LABEL"
                  " --modes archive,index,...\n"
               << "  tardis client list --clients-db FILE\n"
               << "  tardis client revoke --clients-db FILE --id CLIENT_ID\n";
@@ -1067,7 +1072,7 @@ int main(int argc, char** argv) {
         }
         std::filesystem::path archive;
         std::filesystem::path clients_db;
-        std::string label, modes, listen = "127.0.0.1";
+        std::string label, modes, fingerprint, listen = "127.0.0.1";
         std::filesystem::path cert_file, key_file;
         std::int64_t id{};
         unsigned short port = 1965;
@@ -1081,6 +1086,7 @@ int main(int argc, char** argv) {
             if (option == "--archive") archive = next();
             else if (option == "--clients-db") clients_db = next();
             else if (option == "--cert") cert_file = next();
+            else if (option == "--fingerprint") fingerprint = next();
             else if (option == "--key") key_file = next();
             else if (option == "--label") label = next();
             else if (option == "--modes") modes = next();
@@ -1107,9 +1113,13 @@ int main(int argc, char** argv) {
         drogon::sync_wait(clients.open());
         if (command == "client") {
             if (action == "add") {
-                if (cert_file.empty()) throw std::invalid_argument("--cert is required");
+                if (cert_file.empty() == fingerprint.empty())
+                    throw std::invalid_argument("exactly one of --cert or --fingerprint is required");
                 std::cout << drogon::sync_wait(clients.add(
-                                 label, tardis::certificate_fingerprint(cert_file), mode_bits(modes)))
+                                 label, cert_file.empty()
+                                            ? tardis::normalize_certificate_fingerprint(fingerprint)
+                                            : tardis::certificate_fingerprint(cert_file),
+                                 mode_bits(modes)))
                           << '\n';
             } else if (action == "list") {
                 for (const auto& client : drogon::sync_wait(clients.list()))

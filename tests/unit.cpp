@@ -4,6 +4,7 @@
 
 #include "crawler.hpp"
 #include "archive_link_rewrite.hpp"
+#include "api_client_store.hpp"
 #include "exclusion.hpp"
 #include "format.hpp"
 #include "media_type.hpp"
@@ -17,6 +18,12 @@ int main() {
     assert(tardis::format_iec_bytes(0) == "0 bytes");
     assert(tardis::format_iec_bytes(1024) == "1.00 KiB");
     assert(tardis::format_iec_bytes(79347843) == "75.67 MiB");
+    assert(tardis::normalize_certificate_fingerprint(
+               "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899") ==
+           "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99");
+    assert(tardis::normalize_certificate_fingerprint(
+               "aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:00:11:22:33:44:55:66:77:88:99") ==
+           "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99");
     const auto gemini_mime = tardis::MediaType::parse(
         " Text/Gemini ; charset=\"utf-8\" ; lang=en ");
     assert(gemini_mime && gemini_mime->is("text", "gemini"));
