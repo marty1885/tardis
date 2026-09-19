@@ -73,8 +73,13 @@ struct Object {
 
 struct CrawlResult {
     std::int64_t crawl_result_id{};
+    // Internal identity of crawling_url, used for redirect-cycle detection.
+    std::int64_t page_id{};
     std::string crawling_url;
     std::optional<std::string> redirected_to;
+    // Internal identity of redirected_to. Keeping this alongside the URL lets
+    // request paths follow redirects without another URL-to-page lookup.
+    std::optional<std::int64_t> redirected_to_page_id;
     std::int16_t redirect_count{};
     std::optional<Certificate> certificate;
     std::int64_t started_at_unix_millis{};
@@ -270,6 +275,12 @@ class Catalog {
         std::string_view canonical_url, Use use,
         std::optional<std::int64_t> as_of_unix_millis = std::nullopt);
 
+    // As retrieve(), but starts from the catalog's page identity. Used while
+    // walking recorded redirect targets.
+    drogon::Task<std::optional<CrawlResult>> retrieve_page(
+        std::int64_t page_id, Use use,
+        std::optional<std::int64_t> as_of_unix_millis = std::nullopt);
+
     // An immutable capture address scoped to its canonical page URL.
     drogon::Task<std::optional<CrawlResult>> capture(std::string_view canonical_url,
                                                      std::int64_t crawl_result_id, Use use);
@@ -277,11 +288,14 @@ class Catalog {
     // Oldest first within (after, through], with an exclusive stable cursor
     // suitable for resumption.  Repeated captures whose status, metadata,
     // redirect state, and body are unchanged from this use's prior eligible
-    // capture are omitted; archive history retains every capture.
+    // capture are omitted; archive history retains every capture. When set,
+    // maximum_body_bytes omits captures with larger bodies but retains
+    // bodyless results such as redirects.
     drogon::Task<std::vector<CrawlResult>> since(SinceCursor after,
                                                  std::int64_t through_unix_millis, Use use,
                                                  std::size_t limit = 1000,
-                                                 const std::vector<std::string>& mime_types = {});
+                                                 const std::vector<std::string>& mime_types = {},
+                                                 std::optional<std::int64_t> maximum_body_bytes = std::nullopt);
 
     // Appends history and advances the page's latest pointer in one writer
     // transaction. Referenced objects must already be durable in objects.sqlite3.

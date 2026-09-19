@@ -254,7 +254,7 @@ R"gemini(# TARDIS API
 
 TARDIS provides a Gemini API for archive retrieval and page-change feeds.
 
-Archive retrieval, page-change feeds, and mode-specific feed listings are available only over Gemini with a client certificate. A client certificate is authorized by its SHA-256 fingerprint and the virtual crawler modes assigned to it. No certificate returns 60; an unrecognized, revoked, or mode-denied certificate returns 61. HTTP requests cannot carry this Gemini certificate and therefore return 403 on those protected routes.
+Archive retrieval, page-change feeds, and mode-specific feed listings are available only over Gemini with a client certificate. Each client certificate are assigned virtual crawler. All requests to private endpoints without certificate returns 60; unrecognized, revoked, or mode-denied certificate returns 61. As HTTP requests cannot carry clients certificate, they return 403 on the protected routes.
 
 There is currently no self served API sign up. Please send an message along with your client certificate's SHA-256 fingerprint to the author for access to the non-public endpoints:
 
@@ -315,7 +315,7 @@ Mode is one of one of the following. URL components are percent-encoded path par
 ### Page changes
 
 ```format for page changes
-/api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}[/mime/{mime_types}][/page/{paging_token}][/limit/{page_size}]
+/api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}[/mime/{mime_types}][/size/{maximum_body_bytes}][/page/{paging_token}][/limit/{page_size}]
 ```
 
 This returns JSON page-change events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged change run stable while new crawl results arrive. It is designed for search engines to learn which pages need reindexing without downloading every crawl. A page is emitted for its first eligible capture and thereafter only when its status, metadata, redirect state, or body changes; unchanged recrawls remain in archive history but are omitted. Results contain metadata, URLs, and the body digest and size, never body bytes. Limit defaults to 100 and accepts 1 through 1000.
@@ -324,10 +324,20 @@ Use the body digest to avoid fetching a representation already held by the clien
 
 The optional mime_types segment is a percent-encoded comma-separated list of MIME types. It filters body results before paging, so a text-only indexer does not download PDF bodies it will not index. Redirect results with a resolved target are always included so an indexer can update URL mappings. These events include status_code, url, and redirected_to, even when the target page was crawled earlier.
 
+Every Gemini 30 or 31 redirect response additionally creates redirect_chain in the event. It is resolved at the feed's till_unix_millis watermark, so all hops use one stable archive view. redirect_chain.hops contains the redirect hops and its terminal capture; final_url being the terminal URL. All redirection fields are raw Gemini redirect reference received from the origin and may be relative or not caonicalized. For an incomplete chain, final_url is likewise the last raw redirect reference. verdict indicates if the redirection is considered perament in Gemini semantics - only when all hops in the redirection chain are Gemini status 31 is verdict permanent. A non-complete resolution has verdict unknown. At most 16 redirect hops are followed. Gemini 32 and 33 responses are not treated as redirects.
+
+The optional size segment accepts a non-negative maximum uncompressed body size in bytes. Captures whose body is larger are omitted, while redirects and results with no body remain available. Use it to receive only bodies your client can fetch and process. Like MIME filtering, it is part of the paging and batch-token scope.
+
 Example MIME filter:
 
 ```example with MIME filer
 /api/v1/updates/archive/0/1767225800000/mime/text%2Fgemini%2Ctext%2Fplain
+```
+
+Example size filter (1 MiB):
+
+```example with size filter
+/api/v1/updates/archive/0/1767225800000/size/1048576
 ```
 
 Example response:
@@ -349,9 +359,9 @@ Example response:
     "body_blake2b_256": "..."
   }],
   "has_more": true,
-  "batch_token": "b1.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225600000.0.1767225700456.42",
-  "next_page_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42",
-  "resume_token": "p3.1767225600000.1767225800000.archive.7d18a49894551b6c.1767225700456.42"
+  "batch_token": "b2.1767225600000.1767225800000.archive.7d18a49894551b6c.-.-.1767225600000.0.1767225700456.42",
+  "next_page_token": "p4.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42",
+  "resume_token": "p4.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42"
 }
 ```
 
@@ -369,7 +379,7 @@ Each non-empty page-change response includes a batch_token. Fetch it over the sa
 
 The response is always a zstd-compressed WARC/1.0 stream with MIME type application/warc; compression=zstd. It contains a JSON manifest resource at urn:tardis:batch:manifest followed by one WARC resource record for each changed capture that has an archived body. The manifest lists every change in the batch, including redirects and failures that have no body, and maps its body metadata to the corresponding WARC target URI.
 
-The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME filter, and exact page of changes, so a batch never contains unrelated captures.
+The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME and size filters, and exact page of changes, so a batch never contains unrelated captures.
 
 The WARC record payload is the original raw body bytes. A client must zstd-decompress the response before passing it to a WARC reader.
 
