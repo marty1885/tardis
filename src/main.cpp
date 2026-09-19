@@ -271,6 +271,14 @@ std::string read_body(const tardis::ObjectStore& objects, const tardis::Object& 
     return body;
 }
 
+std::string warc_target_uri(std::string_view current_url) {
+    tlgs::Url url{std::string(current_url)};
+    if (!url.good() || url.protocol() != "gemini" || url.host().empty())
+        throw std::runtime_error("catalog contains a non-Gemini WARC target URL");
+    url.withFragment("");
+    return url.str();
+}
+
 drogon::HttpResponsePtr archived_response(const drogon::HttpRequestPtr& request,
                                           const CrawlResult& result,
                                           const tardis::ArchiveNeighbors& neighbors,
@@ -758,7 +766,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 Json::Value items(Json::arrayValue);
                 for (const auto& [result, body] : records) {
                     auto item = metadata(result);
-                    if (result.object) item["warc_target_uri"] = result.crawling_url;
+                    if (result.object) item["warc_target_uri"] = warc_target_uri(result.crawling_url);
                     items.append(std::move(item));
                 }
                 manifest["results"] = std::move(items);
@@ -783,7 +791,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                                         final.committed_at_unix_millis);
                     for (const auto& [result, body] : records)
                         if (result.object)
-                            write_warc_resource(writer, result.crawling_url, body,
+                            write_warc_resource(writer, warc_target_uri(result.crawling_url), body,
                                                 result.committed_at_unix_millis);
                     archive_check(archive_write_close(writer), writer, "close WARC output");
                 } catch (...) {
