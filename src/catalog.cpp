@@ -536,34 +536,6 @@ void Catalog::open(bool recover_claims) {
             "INSERT INTO snapshot_meta(key,value) VALUES"
             "('certificate_changes_pkix_v1','complete')");
     }
-    const auto certificate_backfill = writer_->execSqlSync(
-        "SELECT 1 FROM snapshot_meta WHERE key='certificate_changes_backfill_v1' LIMIT 1");
-    if (certificate_backfill.empty()) {
-        // Existing snapshots predate the trigger. Backfill their history once;
-        // the trigger above records every change made after this point.
-        writer_->execSqlSync(R"sql(
-            INSERT OR IGNORE INTO certificate_changes(
-                host_id,previous_crawl_result_id,previous_certificate_id,
-                crawl_result_id,certificate_id,observed_at_unix_millis)
-            WITH observations AS (
-                SELECT p.host_id,cr.crawl_result_id,cr.certificate_id,cr.ended_at_unix_millis,
-                       lag(cr.crawl_result_id) OVER host_history AS previous_crawl_result_id,
-                       lag(cr.certificate_id) OVER host_history AS previous_certificate_id
-                FROM crawl_results AS cr
-                JOIN pages AS p ON p.page_id=cr.page_id
-                WHERE cr.certificate_id IS NOT NULL
-                WINDOW host_history AS (PARTITION BY p.host_id ORDER BY cr.crawl_result_id)
-            )
-            SELECT host_id,previous_crawl_result_id,previous_certificate_id,
-                   crawl_result_id,certificate_id,ended_at_unix_millis
-            FROM observations
-            WHERE previous_certificate_id IS NOT NULL
-              AND previous_certificate_id != certificate_id
-        )sql");
-        writer_->execSqlSync(
-            "INSERT INTO snapshot_meta(key,value) VALUES"
-            "('certificate_changes_backfill_v1','complete')");
-    }
     writer_->execSqlSync(
         "INSERT OR IGNORE INTO snapshot_meta(key,value) VALUES"
         "('format','tardis/1'),('time_unit','unix_millis'),"
@@ -573,6 +545,17 @@ void Catalog::open(bool recover_claims) {
     writer_->execSqlSync(
         "UPDATE crawl_queue SET state_code=0,claimed_at_unix_millis=NULL "
         "WHERE state_code=1");
+    // Older snapshots may contain security.txt targets which were registered
+    // as automatic watches but never reached the crawl queue. Requeue only
+    // those never fetched; normal periodic revisits keep their schedule.
+    writer_->execSqlSync(
+        "INSERT INTO crawl_queue(page_id,host_id,state_code,reason_bitfield,"
+        "ready_at_unix_millis) "
+        "SELECT a.page_id,p.host_id,0,4,CAST(unixepoch('subsec')*1000 AS INTEGER) "
+        "FROM automatic_update_pages AS a JOIN pages AS p ON p.page_id=a.page_id "
+        "LEFT JOIN crawl_queue AS q ON q.page_id=a.page_id "
+        "WHERE (a.target_bitfield & 8) != 0 AND p.latest_crawl_result_id IS NULL "
+        "AND q.page_id IS NULL");
     writer_->execSqlSync(
         "UPDATE hosts SET next_queued_crawl_unix_millis=("
         "SELECT min(ready_at_unix_millis) FROM crawl_queue "
@@ -1380,13 +1363,32 @@ drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
 
             for (const auto& security_page : completed.security_check_pages) {
                 const auto security_page_id = co_await ensure_page(security_page);
-                co_await transaction->execSqlCoro(
+                const auto automatic = co_await transaction->execSqlCoro(
                     "INSERT OR IGNORE INTO automatic_update_pages("
                     "page_id,target_bitfield,first_recognized_unix_millis,"
                     "last_recognized_unix_millis,next_enqueue_unix_millis) VALUES(?,?,?,?,?)",
                     security_page_id, static_cast<int>(AutomaticTarget::security_txt),
                     result.ended_at_unix_millis, result.ended_at_unix_millis,
                     result.ended_at_unix_millis);
+                // Queue the first probe with the discovery transaction. A
+                // large crawl may never drain its ordinary queue, so waiting
+                // for the periodic-watch scheduler would otherwise leave this
+                // initial check pending indefinitely.
+                if (automatic.affectedRows() == 0)
+                    continue;
+                const auto page_rows = co_await transaction->execSqlCoro(
+                    "SELECT host_id FROM pages WHERE page_id=?", security_page_id);
+                if (page_rows.empty())
+                    throw std::runtime_error("failed to find security.txt page host");
+                const auto security_host_id = page_rows[0]["host_id"].as<std::int64_t>();
+                co_await transaction->execSqlCoro(
+                    "INSERT INTO crawl_queue(page_id,host_id,state_code,reason_bitfield,"
+                    "ready_at_unix_millis) VALUES(?,?,0,?,?) "
+                    "ON CONFLICT(page_id) DO UPDATE SET "
+                    "reason_bitfield=reason_bitfield|excluded.reason_bitfield",
+                    security_page_id, security_host_id,
+                    static_cast<int>(QueueReason::automatic), result.ended_at_unix_millis);
+                affected_hosts.insert(security_host_id);
             }
 
             if (!completed.discovered_pages.empty()) {
