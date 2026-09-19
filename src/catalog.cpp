@@ -119,9 +119,12 @@ drogon::Task<void> refresh_host_queue_time(const drogon::orm::DbClientPtr& clien
 CrawlResult decode_result(const drogon::orm::Row& row) {
     CrawlResult result;
     result.crawl_result_id = row["crawl_result_id"].as<std::int64_t>();
+    result.page_id = row["page_id"].as<std::int64_t>();
     result.crawling_url = row["crawling_url"].as<std::string>();
     if (!row["redirected_to"].isNull())
         result.redirected_to = row["redirected_to"].as<std::string>();
+    if (!row["redirected_to_page_id"].isNull())
+        result.redirected_to_page_id = row["redirected_to_page_id"].as<std::int64_t>();
     result.redirect_count = row["redirect_count"].as<std::int16_t>();
     result.started_at_unix_millis = row["started_at_unix_millis"].as<std::int64_t>();
     result.ended_at_unix_millis = row["ended_at_unix_millis"].as<std::int64_t>();
@@ -151,8 +154,10 @@ CrawlResult decode_result(const drogon::orm::Row& row) {
 
 constexpr std::string_view kResultProjection = R"sql(
 SELECT cr.crawl_result_id,
+       cr.page_id,
        p.url AS crawling_url,
        redirected.url AS redirected_to,
+       cr.redirected_to_page_id,
        cr.redirect_count,
        cr.started_at_unix_millis,
        cr.ended_at_unix_millis,
@@ -620,7 +625,8 @@ LIMIT 1)sql";
 drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after,
                                                       std::int64_t through_unix_millis, Use use,
                                                       std::size_t limit,
-                                                      const std::vector<std::string>& mime_types) {
+                                                      const std::vector<std::string>& mime_types,
+                                                      std::optional<std::int64_t> maximum_body_bytes) {
     if (!reader_)
         throw std::logic_error("catalog is not open");
     limit = std::clamp<std::size_t>(limit, 1, kMaximumPageSize);
@@ -665,15 +671,25 @@ WHERE (cr.committed_at_unix_millis > ? OR
         }
         sql += "))";
     }
+    if (maximum_body_bytes) sql += " AND (objects.raw_bytes IS NULL OR objects.raw_bytes <= ?)";
     sql += R"sql(
 ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
-    const auto rows = co_await reader_->execSqlCoro(
-        sql, after.committed_at_unix_millis, after.committed_at_unix_millis, after.crawl_result_id,
-        use_bit(use), through_unix_millis, use_bit(use), static_cast<std::int64_t>(limit));
+    std::optional<drogon::orm::Result> rows;
+    if (maximum_body_bytes) {
+        rows.emplace(co_await reader_->execSqlCoro(
+            sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
+            after.crawl_result_id, use_bit(use), through_unix_millis, use_bit(use),
+            *maximum_body_bytes, static_cast<std::int64_t>(limit)));
+    } else {
+        rows.emplace(co_await reader_->execSqlCoro(
+            sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
+            after.crawl_result_id, use_bit(use), through_unix_millis, use_bit(use),
+            static_cast<std::int64_t>(limit)));
+    }
     std::vector<CrawlResult> results;
-    results.reserve(rows.size());
-    for (const auto& row : rows) results.push_back(decode_result(row));
+    results.reserve(rows->size());
+    for (const auto& row : *rows) results.push_back(decode_result(row));
     co_return results;
 }
 
@@ -690,6 +706,24 @@ ORDER BY cr.committed_at_unix_millis DESC, cr.crawl_result_id DESC
 LIMIT 1)sql";
     const auto rows = co_await reader_->execSqlCoro(
         sql, std::string(canonical_url), use_bit(use), as_of_unix_millis ? 1 : 0,
+        as_of_unix_millis.value_or(0));
+    if (rows.empty())
+        co_return std::nullopt;
+    co_return decode_result(rows.front());
+}
+
+drogon::Task<std::optional<CrawlResult>> Catalog::retrieve_page(
+    std::int64_t page_id, Use use, std::optional<std::int64_t> as_of_unix_millis) {
+    if (!reader_)
+        throw std::logic_error("catalog is not open");
+    const auto sql = std::string(kResultProjection) +
+                     R"sql(
+WHERE cr.page_id = ? AND (cr.robots_bitfield & ?) != 0
+  AND (? = 0 OR cr.committed_at_unix_millis <= ?)
+ORDER BY cr.committed_at_unix_millis DESC, cr.crawl_result_id DESC
+LIMIT 1)sql";
+    const auto rows = co_await reader_->execSqlCoro(
+        sql, page_id, use_bit(use), as_of_unix_millis ? 1 : 0,
         as_of_unix_millis.value_or(0));
     if (rows.empty())
         co_return std::nullopt;

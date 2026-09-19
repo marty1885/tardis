@@ -99,6 +99,15 @@ int main() {
         assert(filtered.size() == 1 && filtered[0].crawl_result_id == 2);
         assert(filtered[0].redirected_to &&
                *filtered[0].redirected_to == "gemini://example.org/next");
+        assert(filtered[0].redirected_to_page_id && *filtered[0].redirected_to_page_id == 2);
+        assert(!drogon::sync_wait(catalog.retrieve_page(2, tardis::Use::tlgs, 1500)));
+        const auto size_filtered = drogon::sync_wait(catalog.since(
+            {0, 0}, 1500, tardis::Use::archiver, 100, {}, 11));
+        assert(size_filtered.empty());
+        const auto size_filtered_with_bodyless_result = drogon::sync_wait(catalog.since(
+            {0, 0}, 1500, tardis::Use::tlgs, 100, {}, 0));
+        assert(size_filtered_with_bodyless_result.size() == 1);
+        assert(size_filtered_with_bodyless_result[0].crawl_result_id == 2);
 
         const auto changed_feed = drogon::sync_wait(catalog.since(
             {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver));
