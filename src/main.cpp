@@ -1,9 +1,8 @@
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpTypes.h>
 #include <drogon/drogon.h>
-#include <archive.h>
-#include <archive_entry.h>
 #include <sodium.h>
+#include <zstd.h>
 #include <dremini/GeminiServer.hpp>
 
 #include <array>
@@ -522,61 +521,50 @@ bool after(const tardis::SinceCursor& left, const tardis::SinceCursor& right) {
             left.crawl_result_id > right.crawl_result_id);
 }
 
-struct ArchiveOutput { std::string bytes; };
-
-int archive_open(struct archive*, void*) { return ARCHIVE_OK; }
-
-la_ssize_t archive_write(struct archive* writer, void* client_data, const void* data,
-                         std::size_t size) {
-    try {
-        auto& output = static_cast<ArchiveOutput*>(client_data)->bytes;
-        output.append(static_cast<const char*>(data), size);
-        return static_cast<la_ssize_t>(size);
-    } catch (...) {
-        // Exceptions must not unwind through libarchive's C stack.
-        archive_set_error(writer, ENOMEM, "cannot buffer WARC output");
-        return -1;
-    }
+std::string warc_record_id() {
+    std::array<std::byte, 16> bytes;
+    randombytes_buf(bytes.data(), bytes.size());
+    bytes[6] = static_cast<std::byte>((std::to_integer<unsigned char>(bytes[6]) & 0x0f) | 0x40);
+    bytes[8] = static_cast<std::byte>((std::to_integer<unsigned char>(bytes[8]) & 0x3f) | 0x80);
+    const auto encoded = hex(bytes);
+    return encoded.substr(0, 8) + '-' + encoded.substr(8, 4) + '-' + encoded.substr(12, 4) + '-' +
+           encoded.substr(16, 4) + '-' + encoded.substr(20);
 }
 
-int archive_close(struct archive*, void*) { return ARCHIVE_OK; }
-
-void archive_check(int result, struct archive* writer, std::string_view operation) {
-    if (result != ARCHIVE_OK) {
-        const auto* error = archive_error_string(writer);
-        throw std::runtime_error(std::string(operation) + ": " +
-                                 (error ? error : "unknown libarchive error"));
-    }
+std::string warc_timestamp(std::int64_t unix_millis) {
+    // The WARC/1.0 profile uses an integral-second ISO 8601 timestamp.
+    const auto timestamp = utc_timestamp(unix_millis);
+    return timestamp.substr(0, 19) + 'Z';
 }
 
-void write_warc_resource(struct archive* writer, std::string_view target, std::string_view body,
+void write_warc_resource(std::string& output, std::string_view target, std::string_view body,
                          std::int64_t unix_millis) {
-    archive_entry* entry = archive_entry_new();
-    if (!entry) throw std::runtime_error("cannot allocate WARC entry");
-    try {
-        const std::string target_copy(target);
-        archive_entry_set_pathname(entry, target_copy.c_str());
-        archive_entry_set_filetype(entry, AE_IFREG);
-        archive_entry_set_perm(entry, 0644);
-        archive_entry_set_size(entry, static_cast<la_int64_t>(body.size()));
-        archive_entry_set_mtime(entry, static_cast<time_t>(unix_millis / 1000), 0);
-        archive_check(archive_write_header(writer, entry), writer, "write WARC header");
-        std::size_t written{};
-        while (written < body.size()) {
-            const auto count = archive_write_data(writer, body.data() + written, body.size() - written);
-            if (count <= 0) {
-                const auto* error = archive_error_string(writer);
-                throw std::runtime_error("write WARC body: " +
-                                         std::string(error ? error : "short WARC write"));
-            }
-            written += static_cast<std::size_t>(count);
-        }
-        archive_check(archive_write_finish_entry(writer), writer, "finish WARC entry");
-    } catch (...) {
-        archive_entry_free(entry);
-        throw;
-    }
-    archive_entry_free(entry);
+    // URI bytes are written verbatim in the WARC field value.  Reject header
+    // delimiters, but intentionally impose no size limit: libarchive's small
+    // fixed header buffer must not make a valid stored URI unexportable.
+    if (target.find_first_of("\r\n") != std::string_view::npos)
+        throw std::runtime_error("WARC target URI contains a header delimiter");
+    output += "WARC/1.0\r\nWARC-Type: resource\r\nWARC-Target-URI: ";
+    output += target;
+    output += "\r\nWARC-Date: ";
+    output += warc_timestamp(unix_millis);
+    output += "\r\nWARC-Record-ID: <urn:uuid:";
+    output += warc_record_id();
+    output += "\r\nContent-Type: application/octet-stream\r\nContent-Length: ";
+    output += std::to_string(body.size());
+    output += "\r\n\r\n";
+    output += body;
+    output += "\r\n\r\n";
+}
+
+std::string zstd_compress_warc(std::string_view warc) {
+    std::string compressed(ZSTD_compressBound(warc.size()), '\0');
+    const auto size = ZSTD_compress(compressed.data(), compressed.size(), warc.data(), warc.size(), 3);
+    if (ZSTD_isError(size))
+        throw std::runtime_error("cannot zstd-compress WARC output: " +
+                                 std::string(ZSTD_getErrorName(size)));
+    compressed.resize(size);
+    return compressed;
 }
 
 // All authenticated API routes delegate here. Drogon route templates validate
@@ -784,35 +772,17 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 json_writer["indentation"] = "";
                 const auto manifest_body = Json::writeString(json_writer, manifest);
 
-                ArchiveOutput output;
-                output.bytes.reserve(body_bytes + manifest_body.size());
-                archive* writer = archive_write_new();
-                if (!writer) throw std::runtime_error("cannot allocate WARC writer");
-                try {
-                    // libarchive otherwise pads its output to 10 KiB after the
-                    // zstd filter has finalized, leaving raw bytes after the
-                    // compressed frame.
-                    archive_check(archive_write_set_bytes_per_block(writer, 1), writer,
-                                  "disable WARC output block padding");
-                    archive_check(archive_write_add_filter_zstd(writer), writer, "enable WARC zstd compression");
-                    archive_check(archive_write_set_format_warc(writer), writer, "select WARC format");
-                    archive_check(archive_write_open(writer, &output, archive_open, archive_write, archive_close),
-                                  writer, "open WARC output");
-                    write_warc_resource(writer, "urn:tardis:batch:manifest", manifest_body,
-                                        final.committed_at_unix_millis);
-                    for (const auto& [result, body] : records)
-                        if (result.object)
-                            write_warc_resource(writer, warc_target_uri(result.crawling_url), body,
-                                                result.committed_at_unix_millis);
-                    archive_check(archive_write_close(writer), writer, "close WARC output");
-                } catch (...) {
-                    archive_write_free(writer);
-                    throw;
-                }
-                archive_write_free(writer);
+                std::string warc;
+                warc.reserve(body_bytes + manifest_body.size());
+                write_warc_resource(warc, "urn:tardis:batch:manifest", manifest_body,
+                                    final.committed_at_unix_millis);
+                for (const auto& [result, body] : records)
+                    if (result.object)
+                        write_warc_resource(warc, warc_target_uri(result.crawling_url), body,
+                                            result.committed_at_unix_millis);
                 auto response = drogon::HttpResponse::newHttpResponse();
                 response->setContentTypeString("application/warc; compression=zstd");
-                response->setBody(std::move(output.bytes));
+                response->setBody(zstd_compress_warc(warc));
                 response->addHeader("Cache-Control", "private, no-store");
                 reply(response);
             } catch (const std::exception& error) {

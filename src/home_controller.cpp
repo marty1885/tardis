@@ -377,7 +377,7 @@ Each non-empty page-change response includes a batch_token. Fetch it over the sa
 /api/v1/batch/{batch_token}
 ```
 
-The response is always a zstd-compressed WARC/1.0 stream with MIME type application/warc; compression=zstd. It contains a JSON manifest resource at urn:tardis:batch:manifest followed by one WARC resource record for each changed capture that has an archived body. The manifest lists every change in the batch, including redirects and failures that have no body, and maps its body metadata to the corresponding WARC target URI.
+The response is always a zstd-compressed WARC/1.0 stream with MIME type application/warc; compression=zstd. It contains a JSON manifest resource at urn:tardis:batch:manifest followed by one WARC resource record for each changed capture that has an archived body. The manifest lists every change in the batch, including redirects and failures that have no body, and maps its body metadata to the corresponding WARC target URI. TARDIS serializes these records itself because libarchive rejects long WARC headers; consumers must accept valid WARC records whose target URIs exceed libarchive's implementation limit.
 
 The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME and size filters, and exact page of changes, so a batch never contains unrelated captures.
 

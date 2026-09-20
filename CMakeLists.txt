@@ -9,7 +9,6 @@ find_package(Drogon REQUIRED)
 find_package(SQLite3 REQUIRED)
 find_library(TARDIS_SQLITE3_LIBRARY NAMES sqlite3 REQUIRED)
 find_library(ZSTD_LIBRARY zstd REQUIRED)
-find_library(ARCHIVE_LIBRARY archive REQUIRED)
 find_library(SODIUM_LIBRARY sodium REQUIRED)
 find_library(CAP_LIBRARY cap REQUIRED)
 find_library(SECCOMP_LIBRARY seccomp REQUIRED)
@@ -90,7 +89,7 @@ add_executable(tardis src/main.cpp src/home_controller.cpp src/archive_link_rewr
 target_include_directories(tardis PRIVATE src)
 target_link_libraries(tardis PRIVATE tardis_catalog tardis_api_clients dremini tlgs_url
                                          tardis_sandbox Drogon::Drogon ${TARDIS_SQLITE3_LIBRARY}
-                                         ${SODIUM_LIBRARY} ${ZSTD_LIBRARY} ${ARCHIVE_LIBRARY})
+                                         ${SODIUM_LIBRARY} ${ZSTD_LIBRARY})
 target_link_options(tardis PRIVATE "LINKER:--wrap=landlock_create_ruleset"
                     "LINKER:--wrap=landlock_restrict_self")
 

@@ -252,6 +252,11 @@ bool excluded_by_policy(const Url& url, std::string_view* reason) {
     if (contains(text, "/~xkcd/") || contains(text, "/xkcd/"))
         return reject("xkcd-archive");
     const auto path = lower(std::string(url.path()));
+    // This CGI maze appends its state to its own query string on each link.
+    // The resulting route has an unbounded URL space, so do not admit any
+    // query variant to the crawl frontier.
+    if (url.host() == "gem.pwarren.id.au" && path == "/cgi-bin/maze.cgi")
+        return reject("maze-generator");
     // Archive cached views encode historic captures in the query string. They
     // commonly rewrite every link to another cached view, creating an
     // unbounded history crawl. This is intentionally host-agnostic:

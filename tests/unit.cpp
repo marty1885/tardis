@@ -173,6 +173,11 @@ int main() {
            exclusion == "gemski-generator");
     auto ski = tardis::Url::parse("gemini://gemini.thegonz.net/ski/play:(%22state%22,1,0,80)");
     assert(ski && tardis::excluded_by_policy(*ski, &exclusion) && exclusion == "gemski-generator");
+    auto maze = tardis::Url::parse(
+        "gemini://gem.pwarren.id.au/cgi-bin/maze.cgi?width=32&height=16");
+    assert(maze && tardis::excluded_by_policy(*maze, &exclusion) && exclusion == "maze-generator");
+    auto unrelated_maze = tardis::Url::parse("gemini://capsule.example/cgi-bin/maze.cgi?width=32");
+    assert(unrelated_maze && !tardis::excluded_by_policy(*unrelated_maze));
 
     const auto rewritten_gemtext = tardis::rewrite_archived_gemtext_links(
         "=> next.gmi Next\n=> /root?q=x Root\n=> gemini://other.example/a External\n"
