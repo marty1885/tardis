@@ -295,7 +295,8 @@ class Catalog {
                                                  std::int64_t through_unix_millis, Use use,
                                                  std::size_t limit = 1000,
                                                  const std::vector<std::string>& mime_types = {},
-                                                 std::optional<std::int64_t> maximum_body_bytes = std::nullopt);
+                                                 std::optional<std::int64_t> maximum_body_bytes = std::nullopt,
+                                                 std::optional<SinceCursor> through_cursor = std::nullopt);
 
     // Appends history and advances the page's latest pointer in one writer
     // transaction. Referenced objects must already be durable in objects.sqlite3.

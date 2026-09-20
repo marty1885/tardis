@@ -8,6 +8,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -525,10 +526,17 @@ struct ArchiveOutput { std::string bytes; };
 
 int archive_open(struct archive*, void*) { return ARCHIVE_OK; }
 
-la_ssize_t archive_write(struct archive*, void* client_data, const void* data, std::size_t size) {
-    auto& output = static_cast<ArchiveOutput*>(client_data)->bytes;
-    output.append(static_cast<const char*>(data), size);
-    return static_cast<la_ssize_t>(size);
+la_ssize_t archive_write(struct archive* writer, void* client_data, const void* data,
+                         std::size_t size) {
+    try {
+        auto& output = static_cast<ArchiveOutput*>(client_data)->bytes;
+        output.append(static_cast<const char*>(data), size);
+        return static_cast<la_ssize_t>(size);
+    } catch (...) {
+        // Exceptions must not unwind through libarchive's C stack.
+        archive_set_error(writer, ENOMEM, "cannot buffer WARC output");
+        return -1;
+    }
 }
 
 int archive_close(struct archive*, void*) { return ARCHIVE_OK; }
@@ -725,8 +733,9 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
 
                 auto candidates = co_await self->catalog_.since(
                     batch->first, batch->paging.till, *use, 1001, batch->mime_types,
-                    batch->maximum_body_bytes);
+                    batch->maximum_body_bytes, batch->last);
                 std::vector<std::pair<CrawlResult, std::string>> records;
+                records.reserve(candidates.size());
                 constexpr std::size_t maximum_body_bytes = 64U * 1024U * 1024U;
                 std::size_t body_bytes{};
                 for (const auto& result : candidates) {
@@ -735,9 +744,10 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     if (after(result_cursor, batch->last)) break;
                     std::string body;
                     if (result.object) {
-                        body = read_body(self->objects_, *result.object);
-                        if (!records.empty() && body.size() > maximum_body_bytes - body_bytes)
+                        const auto raw_bytes = static_cast<std::uint64_t>(result.object->raw_bytes);
+                        if (!records.empty() && raw_bytes > maximum_body_bytes - body_bytes)
                             break;
+                        body = read_body(self->objects_, *result.object);
                         body_bytes += body.size();
                     }
                     records.emplace_back(result, std::move(body));
@@ -775,6 +785,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 const auto manifest_body = Json::writeString(json_writer, manifest);
 
                 ArchiveOutput output;
+                output.bytes.reserve(body_bytes + manifest_body.size());
                 archive* writer = archive_write_new();
                 if (!writer) throw std::runtime_error("cannot allocate WARC writer");
                 try {

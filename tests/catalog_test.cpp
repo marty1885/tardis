@@ -32,7 +32,12 @@ int main() {
         catalog.open();
 
         sqlite3* db = nullptr;
-        assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &db) == SQLITE_OK);
+        const int open_result = sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &db);
+        if (open_result != SQLITE_OK) {
+            const std::string error = db ? sqlite3_errmsg(db) : "cannot allocate SQLite handle";
+            sqlite3_close(db);
+            throw std::runtime_error("open test catalog: " + error);
+        }
         exec(db, R"sql(
             PRAGMA foreign_keys=ON;
             BEGIN IMMEDIATE;
@@ -139,6 +144,18 @@ int main() {
         const auto update_after_change = drogon::sync_wait(catalog.since(
             {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver));
         assert(update_after_change.size() == 1 && update_after_change[0].crawl_result_id == 4);
+        const tardis::SinceCursor appended_cursor{
+            update_after_change[0].committed_at_unix_millis,
+            update_after_change[0].crawl_result_id};
+        const auto exact_batch_range = drogon::sync_wait(catalog.since(
+            {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver,
+            1000, {}, std::nullopt, appended_cursor));
+        assert(exact_batch_range.size() == 1 && exact_batch_range[0].crawl_result_id == 4);
+        const auto empty_batch_range = drogon::sync_wait(catalog.since(
+            {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver,
+            1000, {}, std::nullopt,
+            tardis::SinceCursor{appended_cursor.committed_at_unix_millis, 3}));
+        assert(empty_batch_range.empty());
         const auto with_appended =
             drogon::sync_wait(catalog.archive("gemini://example.org/", tardis::Use::archiver));
         assert(with_appended.size() == 3);
@@ -227,7 +244,9 @@ int main() {
             {"gemini://example.org/discovered", "example.org"});
         drogon::sync_wait(catalog.publish({}, {completed}));
         const auto stats = drogon::sync_wait(catalog.stats());
-        assert(stats.claimed == 0 && stats.queued == 1 && stats.crawl_results == 5);
+        assert(stats.claimed == 0);
+        assert(stats.queued == 1);
+        assert(stats.crawl_results == 5);
         assert(drogon::sync_wait(catalog.next_ready_unix_millis()));
         const auto published = drogon::sync_wait(
             catalog.archive(watched_page.url, tardis::Use::archiver));

@@ -1,6 +1,7 @@
 #include "catalog.hpp"
 
 #include <algorithm>
+#include <coroutine>
 #include <cstring>
 #include <json/writer.h>
 #include <limits>
@@ -36,6 +37,31 @@ std::vector<char> blob_from_bytes(std::string_view bytes) {
 std::uint16_t use_bit(Use use) {
     return static_cast<std::uint16_t>(use);
 }
+
+class TransactionCommitAwaiter {
+   public:
+    explicit TransactionCommitAwaiter(std::shared_ptr<drogon::orm::Transaction> transaction)
+        : transaction_(std::move(transaction)) {}
+
+    bool await_ready() const noexcept { return false; }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        transaction_->setCommitCallback([this, handle](bool committed) {
+            committed_ = committed;
+            handle.resume();
+        });
+        // Drogon commits a transaction when its final owner releases it.
+        transaction_.reset();
+    }
+
+    void await_resume() const {
+        if (!committed_) throw std::runtime_error("catalog transaction commit failed");
+    }
+
+   private:
+    std::shared_ptr<drogon::orm::Transaction> transaction_;
+    bool committed_{};
+};
 
 std::string sql_string_literal(std::string_view value) {
     std::string literal = "'";
@@ -626,7 +652,8 @@ drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after,
                                                       std::int64_t through_unix_millis, Use use,
                                                       std::size_t limit,
                                                       const std::vector<std::string>& mime_types,
-                                                      std::optional<std::int64_t> maximum_body_bytes) {
+                                                      std::optional<std::int64_t> maximum_body_bytes,
+                                                      std::optional<SinceCursor> through_cursor) {
     if (!reader_)
         throw std::logic_error("catalog is not open");
     limit = std::clamp<std::size_t>(limit, 1, kMaximumPageSize);
@@ -635,6 +662,8 @@ WHERE (cr.committed_at_unix_millis > ? OR
        (cr.committed_at_unix_millis = ? AND cr.crawl_result_id > ?))
   AND (cr.robots_bitfield & ?) != 0
   AND cr.committed_at_unix_millis <= ?
+  AND (? = 0 OR cr.committed_at_unix_millis < ? OR
+       (cr.committed_at_unix_millis = ? AND cr.crawl_result_id <= ?))
   -- A crawl is historical even when it found the same representation, but
   -- search clients only need the first eligible capture and subsequent
   -- changes.  Compare against this use's previous eligible capture: a page
@@ -676,15 +705,22 @@ WHERE (cr.committed_at_unix_millis > ? OR
 ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
     std::optional<drogon::orm::Result> rows;
+    const auto cursor_limit = through_cursor.value_or(SinceCursor{});
     if (maximum_body_bytes) {
         rows.emplace(co_await reader_->execSqlCoro(
             sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
-            after.crawl_result_id, use_bit(use), through_unix_millis, use_bit(use),
+            after.crawl_result_id, use_bit(use), through_unix_millis,
+            through_cursor ? 1 : 0, cursor_limit.committed_at_unix_millis,
+            cursor_limit.committed_at_unix_millis, cursor_limit.crawl_result_id,
+            use_bit(use),
             *maximum_body_bytes, static_cast<std::int64_t>(limit)));
     } else {
         rows.emplace(co_await reader_->execSqlCoro(
             sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
-            after.crawl_result_id, use_bit(use), through_unix_millis, use_bit(use),
+            after.crawl_result_id, use_bit(use), through_unix_millis,
+            through_cursor ? 1 : 0, cursor_limit.committed_at_unix_millis,
+            cursor_limit.committed_at_unix_millis, cursor_limit.crawl_result_id,
+            use_bit(use),
             static_cast<std::int64_t>(limit)));
     }
     std::vector<CrawlResult> results;
@@ -1556,6 +1592,7 @@ drogon::Task<void> Catalog::publish(std::vector<NewObject> objects,
         transaction->rollback();
         throw;
     }
+    co_await TransactionCommitAwaiter(std::move(transaction));
 }
 
 drogon::Task<std::optional<std::int64_t>> Catalog::next_ready_unix_millis() {
@@ -1591,10 +1628,11 @@ drogon::Task<std::optional<std::int64_t>> Catalog::next_watch_unix_millis() {
 drogon::Task<ArchiveStatistics> Catalog::archive_statistics() {
     if (!reader_)
         throw std::logic_error("catalog is not open");
-    const auto migrated = co_await reader_->execSqlCoro(
+    const auto& client = writer_ ? writer_ : reader_;
+    const auto migrated = co_await client->execSqlCoro(
         "SELECT 1 FROM snapshot_meta WHERE key='archive_statistics_v1' LIMIT 1");
     if (!migrated.empty()) {
-        const auto rows = co_await reader_->execSqlCoro(
+        const auto rows = co_await client->execSqlCoro(
             "SELECT archived_pages,uncompressed_archive_bytes,archive_hosts,archive_objects "
             "FROM archive_statistics WHERE singleton=1");
         if (rows.size() != 1)
@@ -1606,7 +1644,7 @@ drogon::Task<ArchiveStatistics> Catalog::archive_statistics() {
     }
     // A newly deployed server can still serve an archive that has not yet
     // been opened by the crawler version carrying the migration.
-    const auto rows = co_await reader_->execSqlCoro(
+    const auto rows = co_await client->execSqlCoro(
         "SELECT (SELECT count(DISTINCT page_id) FROM crawl_results "
         "WHERE (robots_bitfield & ?) != 0) AS archived_pages,"
         "(SELECT coalesce(sum(o.raw_bytes),0) FROM crawl_results AS cr JOIN objects AS o ON o.object_id=cr.object_id "
@@ -1626,7 +1664,8 @@ drogon::Task<ArchiveStatistics> Catalog::archive_statistics() {
 drogon::Task<CatalogStats> Catalog::stats() {
     if (!reader_)
         throw std::logic_error("catalog is not open");
-    const auto rows = co_await reader_->execSqlCoro(
+    const auto& client = writer_ ? writer_ : reader_;
+    const auto rows = co_await client->execSqlCoro(
         "SELECT (SELECT count(*) FROM pages) AS pages,"
         "(SELECT count(*) FROM crawl_queue WHERE state_code=0) AS queued,"
         "(SELECT count(*) FROM crawl_queue WHERE state_code=1) AS claimed,"
@@ -1649,7 +1688,8 @@ drogon::Task<CatalogStats> Catalog::stats() {
 drogon::Task<ProgressStats> Catalog::progress_stats() {
     if (!reader_)
         throw std::logic_error("catalog is not open");
-    const auto rows = co_await reader_->execSqlCoro(
+    const auto& client = writer_ ? writer_ : reader_;
+    const auto rows = co_await client->execSqlCoro(
         "SELECT (SELECT count(*) FROM pages) AS pages,"
         "coalesce(sum(state_code=0),0) AS queued,"
         "coalesce(sum(state_code=1),0) AS claimed "

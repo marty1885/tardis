@@ -109,6 +109,8 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(tardis_catalog_unit tests/catalog_test.cpp)
   target_link_libraries(tardis_catalog_unit PRIVATE tardis_catalog ${TARDIS_SQLITE3_LIBRARY})
+  target_compile_options(tardis_catalog_unit PRIVATE
+                         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
   add_test(NAME tardis_catalog_unit COMMAND tardis_catalog_unit)
 
   add_executable(tardis_unit tests/unit.cpp src/crawler.cpp src/exclusion.cpp
@@ -118,5 +120,7 @@ if(BUILD_TESTING)
   target_link_libraries(tardis_unit PRIVATE dremini tlgs_url tardis_api_clients Drogon::Drogon ${SQLite3_LIBRARIES}
                                            tardis_catalog ${ZSTD_LIBRARY} ${SODIUM_LIBRARY}
                                            OpenSSL::Crypto pugixml::pugixml ${CMAKE_DL_LIBS})
+  target_compile_options(tardis_unit PRIVATE
+                         $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>:-UNDEBUG>)
   add_test(NAME tardis_unit COMMAND tardis_unit)
 endif()
