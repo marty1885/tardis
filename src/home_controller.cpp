@@ -315,29 +315,23 @@ Mode is one of one of the following. URL components are percent-encoded path par
 ### Page changes
 
 ```format for page changes
-/api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}[/mime/{mime_types}][/size/{maximum_body_bytes}][/page/{paging_token}][/limit/{page_size}]
+/api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}/mime/{change_mime_types}/body-mime/{body_mime_types}[/page/{paging_token}][/limit/{page_size}]
 ```
 
 This returns JSON page-change events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged change run stable while new crawl results arrive. It is designed for search engines to learn which pages need reindexing without downloading every crawl. A page is emitted for its first eligible capture and thereafter only when its status, metadata, redirect state, or body changes; unchanged recrawls remain in archive history but are omitted. Results contain metadata, URLs, and the body digest and size, never body bytes. Limit defaults to 100 and accepts 1 through 1000.
 
 Use the body digest to avoid fetching a representation already held by the client. A changed body can be fetched through the batch-fetch endpoint below.
 
-The optional mime_types segment is a percent-encoded comma-separated list of MIME types. It filters body results before paging, so a text-only indexer does not download PDF bodies it will not index. Redirect results with a resolved target are always included so an indexer can update URL mappings. These events include status_code, url, and redirected_to, even when the target page was crawled earlier.
+The required change_mime_types segment is a percent-encoded comma-separated list of MIME types that selects page-change events before paging. The required body_mime_types segment independently selects which archived bodies are placed in the batch WARC. This lets an indexer learn that images exist while downloading only text bodies. Redirect results with a resolved target are always included so an indexer can update URL mappings.
 
 Every Gemini 30 or 31 redirect response additionally creates redirect_chain in the event. It is resolved at the feed's till_unix_millis watermark, so all hops use one stable archive view. redirect_chain.hops contains the redirect hops and its terminal capture; final_url being the terminal URL. All redirection fields are raw Gemini redirect reference received from the origin and may be relative or not caonicalized. For an incomplete chain, final_url is likewise the last raw redirect reference. verdict indicates if the redirection is considered perament in Gemini semantics - only when all hops in the redirection chain are Gemini status 31 is verdict permanent. A non-complete resolution has verdict unknown. At most 16 redirect hops are followed. Gemini 32 and 33 responses are not treated as redirects.
 
-The optional size segment accepts a non-negative maximum uncompressed body size in bytes. Captures whose body is larger are omitted, while redirects and results with no body remain available. Use it to receive only bodies your client can fetch and process. Like MIME filtering, it is part of the paging and batch-token scope.
+Each batch-manifest result reports body_state: included, excluded_by_body_mime, or unavailable. A body filter which matches no stored body is valid: the batch remains a manifest-only WARC response.
 
 Example MIME filter:
 
 ```example with MIME filer
-/api/v1/updates/archive/0/1767225800000/mime/text%2Fgemini%2Ctext%2Fplain
-```
-
-Example size filter (1 MiB):
-
-```example with size filter
-/api/v1/updates/archive/0/1767225800000/size/1048576
+/api/v1/updates/archive/0/1767225800000/mime/text%2Fgemini%2Ctext%2Fplain%2Cimage%2Fpng/body-mime/text%2Fgemini%2Ctext%2Fplain
 ```
 
 Example response:
@@ -359,7 +353,7 @@ Example response:
     "body_blake2b_256": "..."
   }],
   "has_more": true,
-  "batch_token": "b2.1767225600000.1767225800000.archive.7d18a49894551b6c.-.-.1767225600000.0.1767225700456.42",
+  "batch_token": "b0.1767225600000.1767225800000.archive.7d18a49894551b6c.746578742f67656d696e692c746578742f706c61696e2c696d6167652f706e67.746578742f67656d696e692c746578742f706c61696e.-.1767225600000.0.1767225700456.42",
   "next_page_token": "p4.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42",
   "resume_token": "p4.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42"
 }
@@ -379,7 +373,7 @@ Each non-empty page-change response includes a batch_token. Fetch it over the sa
 
 The response is always a zstd-compressed WARC/1.0 stream with MIME type application/warc; compression=zstd. It contains a JSON manifest resource at urn:tardis:batch:manifest followed by one WARC resource record for each changed capture that has an archived body. The manifest lists every change in the batch, including redirects and failures that have no body, and maps its body metadata to the corresponding WARC target URI. TARDIS serializes these records itself because libarchive rejects long WARC headers; consumers must accept valid WARC records whose target URIs exceed libarchive's implementation limit.
 
-The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A batch token is bound to the page-change mode, time window, MIME and size filters, and exact page of changes, so a batch never contains unrelated captures.
+The server limits one batch to 64 MiB of uncompressed body bytes. If more captures from the change page remain, the manifest contains next_batch_token; fetch that token until it is null. A b0 batch token is bound to the page-change mode, time window, both MIME filters, and exact page of changes, so a batch never contains unrelated captures.
 
 The WARC record payload is the original raw body bytes. A client must zstd-decompress the response before passing it to a WARC reader.
 

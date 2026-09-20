@@ -366,6 +366,7 @@ struct BatchPaging {
     tardis::SinceCursor first;
     tardis::SinceCursor last;
     std::vector<std::string> mime_types;
+    std::vector<std::string> body_mime_types;
     std::optional<std::int64_t> maximum_body_bytes;
 };
 
@@ -392,16 +393,19 @@ std::optional<Paging> parse_token(std::string_view token) {
 }
 
 std::string update_filter_id(const std::vector<std::string>& mime_types,
+                             const std::vector<std::string>& body_mime_types,
                              std::optional<std::int64_t> maximum_body_bytes) {
     tardis::Hash256 digest{};
     std::string input;
     for (const auto& type : mime_types) input += type + "\n";
+    input += "body_mime_types=\n";
+    for (const auto& type : body_mime_types) input += type + "\n";
     input += "maximum_body_bytes=" +
              (maximum_body_bytes ? std::to_string(*maximum_body_bytes) : "-") + "\n";
     if (crypto_generichash(reinterpret_cast<unsigned char*>(digest.data()), digest.size(),
                            reinterpret_cast<const unsigned char*>(input.data()), input.size(),
                            nullptr, 0) != 0)
-        throw std::runtime_error("cannot hash MIME filter");
+        throw std::runtime_error("cannot hash update filters");
     return hex(digest).substr(0, 16);
 }
 
@@ -461,58 +465,71 @@ std::optional<std::string> hex_decode(std::string_view value) {
     return decoded;
 }
 
-std::string batch_token_for(std::int64_t since, std::int64_t till, std::string_view name,
-                            std::string_view filter_id, const std::vector<std::string>& mime_types,
-                            std::optional<std::int64_t> maximum_body_bytes,
-                            tardis::SinceCursor first, tardis::SinceCursor last) {
+std::string encode_mime_filters(const std::vector<std::string>& mime_types) {
     std::string filters;
     for (const auto& mime : mime_types) {
         if (!filters.empty()) filters.push_back(',');
         filters += mime;
     }
-    return "b2." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
-           std::string(filter_id) + "." + (filters.empty() ? "-" : hex_encode(filters)) + "." +
+    return filters.empty() ? "-" : hex_encode(filters);
+}
+
+std::string batch_token_for(std::int64_t since, std::int64_t till, std::string_view name,
+                            std::string_view filter_id, const std::vector<std::string>& mime_types,
+                            const std::vector<std::string>& body_mime_types,
+                            std::optional<std::int64_t> maximum_body_bytes,
+                            tardis::SinceCursor first, tardis::SinceCursor last) {
+    return "b0." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
+           std::string(filter_id) + "." + encode_mime_filters(mime_types) + "." +
+           encode_mime_filters(body_mime_types) + "." +
            (maximum_body_bytes ? std::to_string(*maximum_body_bytes) : "-") + "." +
            std::to_string(first.committed_at_unix_millis) + "." + std::to_string(first.crawl_result_id) + "." +
            std::to_string(last.committed_at_unix_millis) + "." + std::to_string(last.crawl_result_id);
 }
 
 std::optional<BatchPaging> parse_batch_token(std::string_view token) {
-    // b2.<since>.<till>.<mode>.<filter-id>.<mime-filters-hex|->.<maximum-body-bytes|->.<first-committed>.<first-id>.<last-committed>.<last-id>
-    std::array<std::string_view, 11> parts;
+    // b0.<since>.<till>.<mode>.<filter-id>.<mime-filters-hex|->.<body-mime-filters-hex|->.<maximum-body-bytes|->.<first-committed>.<first-id>.<last-committed>.<last-id>
+    std::array<std::string_view, 12> parts;
     for (auto& part : parts) {
         const auto dot = token.find('.');
         part = token.substr(0, dot);
         if (dot == std::string_view::npos) token = {};
         else token.remove_prefix(dot + 1);
     }
-    if (!token.empty() || parts[0] != "b2" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
+    if (!token.empty() || parts[0] != "b0" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
     const auto since = integer(parts[1]);
     const auto till = integer(parts[2]);
-    const auto maximum_body_bytes = parts[6] == "-" ? std::optional<std::int64_t>{} : integer(parts[6]);
-    const auto first_committed = integer(parts[7]);
-    const auto first_id = integer(parts[8]);
-    const auto last_committed = integer(parts[9]);
-    const auto last_id = integer(parts[10]);
+    const auto maximum_body_bytes = parts[7] == "-" ? std::optional<std::int64_t>{} : integer(parts[7]);
+    const auto first_committed = integer(parts[8]);
+    const auto first_id = integer(parts[9]);
+    const auto last_committed = integer(parts[10]);
+    const auto last_id = integer(parts[11]);
     if (!since || !till || *till < *since || !first_committed || !first_id || !last_committed || !last_id ||
         *first_id < 0 || *last_id <= 0 || *first_committed < *since || *last_committed < *first_committed ||
         *last_committed > *till ||
         (*last_committed == *first_committed && *last_id <= *first_id) ||
-        (parts[6] != "-" && (!maximum_body_bytes || *maximum_body_bytes < 0)))
+        (parts[7] != "-" && (!maximum_body_bytes || *maximum_body_bytes < 0)))
         return std::nullopt;
-    std::vector<std::string> filters;
-    if (parts[5] != "-") {
-        const auto decoded = hex_decode(parts[5]);
-        if (!decoded) return std::nullopt;
-        const auto parsed = mime_filters(*decoded);
-        if (!parsed || update_filter_id(*parsed, maximum_body_bytes) != parts[4]) return std::nullopt;
-        filters = *parsed;
-    } else if (update_filter_id(filters, maximum_body_bytes) != parts[4]) {
-        return std::nullopt;
-    }
+    const auto decode_filters = [](std::string_view encoded) -> std::optional<std::vector<std::string>> {
+        if (encoded == "-") return std::vector<std::string>{};
+        const auto decoded = hex_decode(encoded);
+        return decoded ? mime_filters(*decoded) : std::nullopt;
+    };
+    const auto filters = decode_filters(parts[5]);
+    const auto body_filters = decode_filters(parts[6]);
+    if (!filters || !body_filters ||
+        update_filter_id(*filters, *body_filters, maximum_body_bytes) != parts[4]) return std::nullopt;
     return BatchPaging{{*since, *till, std::string(parts[3]), std::string(parts[4]), maximum_body_bytes, {}},
-                       {*first_committed, *first_id}, {*last_committed, *last_id}, std::move(filters),
+                       {*first_committed, *first_id}, {*last_committed, *last_id}, std::move(*filters),
+                       std::move(*body_filters),
                        maximum_body_bytes};
+}
+
+bool body_matches_mime_filter(const CrawlResult& result, const std::vector<std::string>& mime_types) {
+    if (!result.object || mime_types.empty()) return result.object.has_value();
+    const auto type = tardis::MediaType::parse(result.meta.value_or(""));
+    if (!type) return false;
+    return std::find(mime_types.begin(), mime_types.end(), type->type + "/" + type->subtype) != mime_types.end();
 }
 
 bool after(const tardis::SinceCursor& left, const tardis::SinceCursor& right) {
@@ -624,11 +641,13 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                  std::optional<std::string> page_token = std::nullopt,
                  std::optional<std::int64_t> limit_value = std::nullopt,
                  std::vector<std::string> mime_types = {},
+                 std::vector<std::string> body_mime_types = {},
                  std::optional<std::int64_t> maximum_body_bytes = std::nullopt) {
         auto self = shared_from_this();
         drogon::async_run([self, request, reply = std::move(reply), mode_name = std::move(mode_name),
                            since, till, page_token = std::move(page_token), limit_value,
-                           mime_types = std::move(mime_types), maximum_body_bytes]() mutable
+                           mime_types = std::move(mime_types), body_mime_types = std::move(body_mime_types),
+                           maximum_body_bytes]() mutable
                               -> drogon::Task<void> {
             try {
                 if (till < since) {
@@ -642,7 +661,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     reply(error_response(drogon::k400BadRequest, "size must be non-negative"));
                     co_return;
                 }
-                const auto filter_id = update_filter_id(mime_types, maximum_body_bytes);
+                const auto filter_id = update_filter_id(mime_types, body_mime_types, maximum_body_bytes);
                 tardis::SinceCursor cursor{since, 0};
                 if (page_token) {
                     const auto paging = parse_token(*page_token);
@@ -693,7 +712,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 else body["next_page_token"] = Json::nullValue;
                 if (!results.empty())
                     body["batch_token"] = batch_token_for(
-                        since, till, mode_name, filter_id, mime_types, maximum_body_bytes, cursor,
+                        since, till, mode_name, filter_id, mime_types, body_mime_types, maximum_body_bytes, cursor,
                         {results.back().committed_at_unix_millis, results.back().crawl_result_id});
                 else body["batch_token"] = Json::nullValue;
                 reply(json_response(std::move(body)));
@@ -731,7 +750,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                         result.committed_at_unix_millis, result.crawl_result_id};
                     if (after(result_cursor, batch->last)) break;
                     std::string body;
-                    if (result.object) {
+                    if (body_matches_mime_filter(result, batch->body_mime_types)) {
                         const auto raw_bytes = static_cast<std::uint64_t>(result.object->raw_bytes);
                         if (!records.empty() && raw_bytes > maximum_body_bytes - body_bytes)
                             break;
@@ -751,7 +770,8 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 const auto next = has_more
                     ? std::optional{batch_token_for(
                         batch->paging.since, batch->paging.till, batch->paging.mode,
-                        batch->paging.mime_filter, batch->mime_types, batch->maximum_body_bytes,
+                        batch->paging.mime_filter, batch->mime_types, batch->body_mime_types,
+                        batch->maximum_body_bytes,
                         final_cursor, batch->last)}
                     : std::optional<std::string>{};
 
@@ -764,7 +784,11 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 Json::Value items(Json::arrayValue);
                 for (const auto& [result, body] : records) {
                     auto item = metadata(result);
-                    if (result.object) item["warc_target_uri"] = warc_target_uri(result.crawling_url);
+                    if (body_matches_mime_filter(result, batch->body_mime_types)) {
+                        item["body_state"] = "included";
+                        item["warc_target_uri"] = warc_target_uri(result.crawling_url);
+                    } else if (result.object) item["body_state"] = "excluded_by_body_mime";
+                    else item["body_state"] = "unavailable";
                     items.append(std::move(item));
                 }
                 manifest["results"] = std::move(items);
@@ -777,7 +801,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 write_warc_resource(warc, "urn:tardis:batch:manifest", manifest_body,
                                     final.committed_at_unix_millis);
                 for (const auto& [result, body] : records)
-                    if (result.object)
+                    if (body_matches_mime_filter(result, batch->body_mime_types))
                         write_warc_resource(warc, warc_target_uri(result.crawling_url), body,
                                             result.committed_at_unix_millis);
                 auto response = drogon::HttpResponse::newHttpResponse();
@@ -1185,7 +1209,7 @@ int main(int argc, char** argv) {
                            const std::string& selector, const std::string& mode_name,
                            const std::string& scheme,
                            const std::string& path, const std::string& param) {
-                api_retrieve(request, std::move(reply), selector, mode_name, scheme, path, param);
+            api_retrieve(request, std::move(reply), selector, mode_name, scheme, path, param);
             }, {drogon::Get});
         const auto api_updates = [api_service](const drogon::HttpRequestPtr& request,
                                                std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1196,14 +1220,51 @@ int main(int argc, char** argv) {
                                                std::vector<std::string> mime_types = {},
                                                std::optional<std::int64_t> maximum_body_bytes = std::nullopt) {
             api_service->updates(request, std::move(reply), mode_name, since, till,
-                                 std::move(page_token), limit, std::move(mime_types), maximum_body_bytes);
+                                 std::move(page_token), limit, mime_types, std::move(mime_types),
+                                 maximum_body_bytes);
+        };
+        const auto api_dual_updates = [api_service](
+                                          const drogon::HttpRequestPtr& request,
+                                          std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+                                          const std::string& mode_name, std::int64_t since,
+                                          std::int64_t till, const std::string& mime_text,
+                                          const std::string& body_mime_text,
+                                          std::optional<std::string> page_token = std::nullopt,
+                                          std::optional<std::int64_t> limit = std::nullopt) {
+            const auto mime_types = mime_filters(mime_text);
+            const auto body_mime_types = mime_filters(body_mime_text);
+            if (!mime_types || !body_mime_types) {
+                reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
+                return;
+            }
+            api_service->updates(request, std::move(reply), mode_name, since, till,
+                                 std::move(page_token), limit, *mime_types, *body_mime_types);
         };
         drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{till}",
-            [api_updates](const drogon::HttpRequestPtr& request,
-                          std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                          const std::string& mode_name, std::int64_t since, std::int64_t till) {
-                api_updates(request, std::move(reply), mode_name, since, till);
+            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}",
+            [api_dual_updates](const drogon::HttpRequestPtr& request,
+                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+                               const std::string& mode_name, std::int64_t since, std::int64_t till,
+                               const std::string& mime, const std::string& body_mime) {
+                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime);
+            }, {drogon::Get});
+        drogon::app().registerHandler(
+            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}/page/{token}",
+            [api_dual_updates](const drogon::HttpRequestPtr& request,
+                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+                               const std::string& mode_name, std::int64_t since, std::int64_t till,
+                               const std::string& mime, const std::string& body_mime,
+                               const std::string& token) {
+                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime, token);
+            }, {drogon::Get});
+        drogon::app().registerHandler(
+            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}/limit/{limit}",
+            [api_dual_updates](const drogon::HttpRequestPtr& request,
+                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
+                               const std::string& mode_name, std::int64_t since, std::int64_t till,
+                               const std::string& mime, const std::string& body_mime, std::int64_t limit) {
+                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime,
+                                 std::nullopt, limit);
             }, {drogon::Get});
         drogon::app().registerHandler(
             "/api/v1/batch/{token}",
@@ -1226,7 +1287,7 @@ int main(int argc, char** argv) {
                           const std::string& mode_name) {
                 api_service->known_security_txt(request, std::move(reply), mode_name);
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/{option}/{value}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1252,7 +1313,7 @@ int main(int argc, char** argv) {
                     reply(error_response(drogon::k404NotFound, "unknown API route"));
                 }
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/{first}/{second}/{third}/{fourth}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1297,7 +1358,7 @@ int main(int argc, char** argv) {
                     reply(error_response(drogon::k404NotFound, "unknown API route"));
                 }
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/size/{size}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1308,7 +1369,7 @@ int main(int argc, char** argv) {
                                          std::nullopt, std::nullopt, *filters, size);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/size/{size}/page/{token}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1319,7 +1380,7 @@ int main(int argc, char** argv) {
                                          token, std::nullopt, *filters, size);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/size/{size}/limit/{limit}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1330,7 +1391,7 @@ int main(int argc, char** argv) {
                                          std::nullopt, limit, *filters, size);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/size/{size}/page/{token}/limit/{limit}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
@@ -1342,7 +1403,7 @@ int main(int argc, char** argv) {
                                          token, limit, *filters, size);
                 else reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
             }, {drogon::Get});
-        drogon::app().registerHandler(
+        if (false) drogon::app().registerHandler(
             "/api/v1/updates/{mode}/{since}/{till}/mime/{filters}/page/{token}/limit/{limit}",
             [api_updates](const drogon::HttpRequestPtr& request,
                           std::function<void(const drogon::HttpResponsePtr&)>&& reply,
