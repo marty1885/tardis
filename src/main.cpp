@@ -415,9 +415,20 @@ std::optional<std::vector<std::string>> mime_filters(std::string_view encoded) {
     std::size_t start{};
     while (start <= decoded.size()) {
         const auto end = decoded.find(',', start);
-        const auto parsed = tardis::MediaType::parse(decoded.substr(start, end - start));
-        if (!parsed) return std::nullopt;
-        const auto type = parsed->type + "/" + parsed->subtype;
+        const auto value = std::string_view(decoded).substr(start, end - start);
+        std::string type;
+        if (value == "*" || value == "*/*") {
+            type = "*";
+        } else if (value.size() > 2 && value.ends_with("/*")) {
+            const auto parsed = tardis::MediaType::parse(
+                std::string(value.substr(0, value.size() - 1)) + "x");
+            if (!parsed) return std::nullopt;
+            type = parsed->type + "/*";
+        } else {
+            const auto parsed = tardis::MediaType::parse(value);
+            if (!parsed) return std::nullopt;
+            type = parsed->type + "/" + parsed->subtype;
+        }
         if (std::find(result.begin(), result.end(), type) == result.end()) result.push_back(type);
         if (end == std::string::npos) break;
         start = end + 1;
@@ -529,7 +540,11 @@ bool body_matches_mime_filter(const CrawlResult& result, const std::vector<std::
     if (!result.object || mime_types.empty()) return result.object.has_value();
     const auto type = tardis::MediaType::parse(result.meta.value_or(""));
     if (!type) return false;
-    return std::find(mime_types.begin(), mime_types.end(), type->type + "/" + type->subtype) != mime_types.end();
+    const auto full = type->type + "/" + type->subtype;
+    return std::any_of(mime_types.begin(), mime_types.end(), [&](const std::string& filter) {
+        return filter == "*" || filter == full ||
+               (filter.ends_with("/*") && filter.substr(0, filter.size() - 1) == full.substr(0, type->type.size() + 1));
+    });
 }
 
 bool after(const tardis::SinceCursor& left, const tardis::SinceCursor& right) {

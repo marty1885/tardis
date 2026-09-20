@@ -689,14 +689,12 @@ WHERE (cr.committed_at_unix_millis > ? OR
         AND previous.meta IS cr.meta
   )
 )sql";
-    if (!mime_types.empty()) {
-        sql += " AND ((cr.status_code BETWEEN 30 AND 39 AND "
-               "cr.redirected_to_page_id IS NOT NULL) OR "
-               "lower(trim(substr(coalesce(cr.meta,''),1,"
-               "instr(coalesce(cr.meta,'') || ';',';')-1))) IN (";
+    if (!mime_types.empty() && std::find(mime_types.begin(), mime_types.end(), "*") == mime_types.end()) {
+        sql += " AND ((cr.status_code BETWEEN 30 AND 39 AND cr.redirected_to_page_id IS NOT NULL) OR (";
         for (std::size_t index = 0; index < mime_types.size(); ++index) {
-            if (index) sql += ',';
-            sql += sql_string_literal(mime_types[index]);
+            if (index) sql += " OR ";
+            sql += "lower(trim(substr(coalesce(cr.meta,''),1,"
+                   "instr(coalesce(cr.meta,'') || ';',';')-1))) GLOB ?";
         }
         sql += "))";
     }
@@ -706,23 +704,16 @@ ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
     std::optional<drogon::orm::Result> rows;
     const auto cursor_limit = through_cursor.value_or(SinceCursor{});
-    if (maximum_body_bytes) {
-        rows.emplace(co_await reader_->execSqlCoro(
-            sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
-            after.crawl_result_id, use_bit(use), through_unix_millis,
-            through_cursor ? 1 : 0, cursor_limit.committed_at_unix_millis,
-            cursor_limit.committed_at_unix_millis, cursor_limit.crawl_result_id,
-            use_bit(use),
-            *maximum_body_bytes, static_cast<std::int64_t>(limit)));
-    } else {
-        rows.emplace(co_await reader_->execSqlCoro(
-            sql, after.committed_at_unix_millis, after.committed_at_unix_millis,
-            after.crawl_result_id, use_bit(use), through_unix_millis,
-            through_cursor ? 1 : 0, cursor_limit.committed_at_unix_millis,
-            cursor_limit.committed_at_unix_millis, cursor_limit.crawl_result_id,
-            use_bit(use),
-            static_cast<std::int64_t>(limit)));
-    }
+    auto binder = *reader_ << sql;
+    binder << after.committed_at_unix_millis << after.committed_at_unix_millis
+           << after.crawl_result_id << use_bit(use) << through_unix_millis
+           << (through_cursor ? 1 : 0) << cursor_limit.committed_at_unix_millis
+           << cursor_limit.committed_at_unix_millis << cursor_limit.crawl_result_id << use_bit(use);
+    if (std::find(mime_types.begin(), mime_types.end(), "*") == mime_types.end())
+        for (const auto& mime : mime_types) binder << mime;
+    if (maximum_body_bytes) binder << *maximum_body_bytes;
+    binder << static_cast<std::int64_t>(limit);
+    rows.emplace(co_await drogon::orm::internal::SqlAwaiter(std::move(binder)));
     std::vector<CrawlResult> results;
     results.reserve(rows->size());
     for (const auto& row : *rows) results.push_back(decode_result(row));
