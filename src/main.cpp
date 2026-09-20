@@ -1238,48 +1238,61 @@ int main(int argc, char** argv) {
                                  std::move(page_token), limit, mime_types, std::move(mime_types),
                                  maximum_body_bytes);
         };
-        const auto api_dual_updates = [api_service](
-                                          const drogon::HttpRequestPtr& request,
-                                          std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                                          const std::string& mode_name, std::int64_t since,
-                                          std::int64_t till, const std::string& mime_text,
-                                          const std::string& body_mime_text,
-                                          std::optional<std::string> page_token = std::nullopt,
-                                          std::optional<std::int64_t> limit = std::nullopt) {
-            const auto mime_types = mime_filters(mime_text);
-            const auto body_mime_types = mime_filters(body_mime_text);
-            if (!mime_types || !body_mime_types) {
-                reply(error_response(drogon::k400BadRequest, "invalid MIME filter"));
-                return;
-            }
-            api_service->updates(request, std::move(reply), mode_name, since, till,
-                                 std::move(page_token), limit, *mime_types, *body_mime_types);
-        };
-        drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}",
-            [api_dual_updates](const drogon::HttpRequestPtr& request,
-                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                               const std::string& mode_name, std::int64_t since, std::int64_t till,
-                               const std::string& mime, const std::string& body_mime) {
-                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime);
-            }, {drogon::Get});
-        drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}/page/{token}",
-            [api_dual_updates](const drogon::HttpRequestPtr& request,
-                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                               const std::string& mode_name, std::int64_t since, std::int64_t till,
-                               const std::string& mime, const std::string& body_mime,
-                               const std::string& token) {
-                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime, token);
-            }, {drogon::Get});
-        drogon::app().registerHandler(
-            "/api/v1/updates/{mode}/{since}/{till}/mime/{mime}/body-mime/{body_mime}/limit/{limit}",
-            [api_dual_updates](const drogon::HttpRequestPtr& request,
-                               std::function<void(const drogon::HttpResponsePtr&)>&& reply,
-                               const std::string& mode_name, std::int64_t since, std::int64_t till,
-                               const std::string& mime, const std::string& body_mime, std::int64_t limit) {
-                api_dual_updates(request, std::move(reply), mode_name, since, till, mime, body_mime,
-                                 std::nullopt, limit);
+        drogon::app().registerHandlerViaRegex(
+            R"(^/api/v1/updates/.*$)",
+            [api_service](const drogon::HttpRequestPtr& request,
+                          std::function<void(const drogon::HttpResponsePtr&)>&& reply) {
+                constexpr std::string_view prefix = "/api/v1/updates/";
+                const std::string_view path = request->path();
+                if (!path.starts_with(prefix)) {
+                    reply(error_response(drogon::k404NotFound, "unknown API route"));
+                    return;
+                }
+                std::vector<std::string_view> parts;
+                auto suffix = path.substr(prefix.size());
+                while (true) {
+                    const auto slash = suffix.find('/');
+                    parts.push_back(suffix.substr(0, slash));
+                    if (slash == std::string_view::npos) break;
+                    suffix.remove_prefix(slash + 1);
+                }
+                if (parts.size() < 7 || (parts.size() - 3) % 2 != 0) {
+                    reply(error_response(drogon::k400BadRequest, "invalid updates route"));
+                    return;
+                }
+                const auto since = integer(parts[1]);
+                const auto till = integer(parts[2]);
+                std::optional<std::string_view> mime, body_mime, page, limit_text, size_text;
+                for (std::size_t index = 3; index < parts.size(); index += 2) {
+                    const auto key = parts[index];
+                    const auto value = parts[index + 1];
+                    auto set = [&](std::optional<std::string_view>& target) {
+                        if (target || value.empty()) return false;
+                        target = value;
+                        return true;
+                    };
+                    const bool valid = key == "mime" ? set(mime) :
+                                       key == "body-mime" ? set(body_mime) :
+                                       key == "page" ? set(page) :
+                                       key == "limit" ? set(limit_text) :
+                                       key == "size" ? set(size_text) : false;
+                    if (!valid) {
+                        reply(error_response(drogon::k400BadRequest, "invalid updates option"));
+                        return;
+                    }
+                }
+                const auto mime_types = mime ? mime_filters(*mime) : std::nullopt;
+                const auto body_mime_types = body_mime ? mime_filters(*body_mime) : std::nullopt;
+                const auto limit = limit_text ? integer(*limit_text) : std::optional<std::int64_t>{};
+                const auto size = size_text ? integer(*size_text) : std::optional<std::int64_t>{};
+                if (!since || !till || !mime_types || !body_mime_types ||
+                    (limit_text && !limit) || (size_text && !size)) {
+                    reply(error_response(drogon::k400BadRequest, "invalid updates route"));
+                    return;
+                }
+                api_service->updates(request, std::move(reply), std::string(parts[0]), *since, *till,
+                                     page ? std::optional<std::string>{*page} : std::nullopt,
+                                     limit, *mime_types, *body_mime_types, size);
             }, {drogon::Get});
         drogon::app().registerHandler(
             "/api/v1/batch/{token}",
