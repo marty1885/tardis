@@ -371,7 +371,7 @@ struct BatchPaging {
 };
 
 std::optional<Paging> parse_token(std::string_view token) {
-    // p4.<since>.<till>.<mode>.<filter-id>.<maximum-body-bytes|->.<committed>.<result-id>
+    // p0.<since>.<till>.<mode>.<filter-id>.<maximum-body-bytes|->.<committed>.<result-id>
     std::array<std::string_view, 8> parts;
     for (auto& part : parts) {
         const auto dot = token.find('.');
@@ -379,7 +379,7 @@ std::optional<Paging> parse_token(std::string_view token) {
         if (dot == std::string_view::npos) token = {};
         else token.remove_prefix(dot + 1);
     }
-    if (!token.empty() || parts[0] != "p4" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
+    if (!token.empty() || parts[0] != "p0" || !mode(parts[3]) || parts[4].empty()) return std::nullopt;
     const auto since = integer(parts[1]);
     const auto till = integer(parts[2]);
     const auto maximum_body_bytes = parts[5] == "-" ? std::optional<std::int64_t>{} : integer(parts[5]);
@@ -438,7 +438,7 @@ std::optional<std::vector<std::string>> mime_filters(std::string_view encoded) {
 
 std::string token_for(std::int64_t since, std::int64_t till, std::string_view name, std::string_view filter_id,
                       std::optional<std::int64_t> maximum_body_bytes, const CrawlResult& result) {
-    return "p4." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
+    return "p0." + std::to_string(since) + "." + std::to_string(till) + "." + std::string(name) + "." +
            std::string(filter_id) + "." +
            (maximum_body_bytes ? std::to_string(*maximum_body_bytes) : "-") + "." +
            std::to_string(result.committed_at_unix_millis) + "." +
