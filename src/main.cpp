@@ -161,6 +161,8 @@ std::string archive_banner(const CrawlResult& result) {
         "\n> size: " + std::to_string(size) + "\n> certificate: " + certificate +
         "\n"
         "```\n"
+        "\n"
+        "> Links in this page are rewritten to point to TARDIS archive for better archive viewing experience\n"
         "\n";
 }
 
