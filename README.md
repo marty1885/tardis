@@ -92,11 +92,15 @@ MIME. Binary data is stored without interpretation; `text/gemini` is also
 parsed for discovery. A body crossing the limit is recorded as `BodyTooLarge`
 and its partial bytes are not published.
 
-`robots.txt` has a separate 64 KiB ceiling. Oversized or failed robots policy
-responses fail closed and enter the normal retry path rather than being stored
-as unbounded catalog metadata. A completed robots response with no usable policy
-(for example, a missing robots document) is cached as an empty allow-all policy;
-transport failure is recorded as `NetworkFailure` and does not complete the page.
+`robots.txt` has a separate 64 KiB ceiling. An absent, oversized, or unreachable
+robots document is treated as an empty allow-all policy; only a successfully
+parsed disallow rule blocks a virtual identity. Failed robots responses are
+retained as bounded history but are not persisted as authoritative policy, and
+their temporary allow-all result is cached in memory to avoid retrying it for
+every queued URL. Consequently a robots transport failure cannot withdraw a
+page from an incremental feed. Robots rules never apply to `/robots.txt`
+itself, so a policy cannot prevent its own refresh or an explicit crawl of the
+policy document.
 
 Bodies and certificates use BLAKE2b-256. Digests occupy 32-byte BLOBs in the
 catalog entries and bodies are deduplicated independently. Bodies live in a
@@ -157,14 +161,20 @@ to an internal service cannot bypass the URL exclusions.
 
 ## SQLite query performance report
 
-Run a crawler with `TARDIS_SQLITE_PROFILE=1` to emit the slowest SQLite
+Run the server or crawler with `TARDIS_SQLITE_PROFILE=1` to emit the slowest SQLite
 statements every five seconds and a cumulative report on exit. Each row reports
 the total time spent inside `sqlite3_step`, number of steps, returned rows,
 mean and maximum step time, followed by the SQL text.
 
 ```sh
 TARDIS_SQLITE_PROFILE=1 ./build/tardis-crawler --snapshot data --persistent
+TARDIS_SQLITE_PROFILE=1 ./build/tardis --archive data ...
 ```
 
-The profiler is linked only into `tardis-crawler`; when disabled its cost is a
-cached environment check before calling SQLite normally.
+When disabled, the profiler's cost is a cached environment check before calling
+SQLite normally.
+
+For incremental-update requests, `TARDIS_UPDATE_PROFILE=1` additionally logs
+wall-clock time for request setup, catalog lookup, redirect resolution, and JSON
+formatting. It can be combined with `TARDIS_SQLITE_PROFILE=1` to identify both
+the slow phase and the individual SQLite statement responsible.

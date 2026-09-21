@@ -635,6 +635,8 @@ bool Crawler::path_blocked(std::string_view path, const std::vector<RobotsRule>&
 }
 
 std::uint16_t Crawler::robots_permissions(std::string_view path, std::string_view source) {
+    // A policy must never make its own well-known location unreachable.
+    if (path == "/robots.txt") return 0x1f;
     std::uint16_t bitfield{};
     for (const auto use : kUses)
         if (!path_blocked(path, robots_rules(source, use)))
@@ -688,6 +690,9 @@ void Crawler::cache_robots(std::string authority, std::string_view source,
 drogon::Task<Crawler::Permission> Crawler::permitted(const Url& url) {
     const auto now = unix_millis();
     const auto authority = url.host_key();
+    // Normal policy refreshes call fetch() directly below. This also protects
+    // /robots.txt when it independently appears in the crawl queue.
+    if (url.path() == "/robots.txt") co_return Permission{0x1f, {}, false};
     if (const auto permissions = cached_robots_permissions(authority, url.path(), now))
         co_return Permission{*permissions, {}, false};
     auto stored = co_await catalog_.robots(url.host_key(), now);
@@ -704,8 +709,13 @@ drogon::Task<Crawler::Permission> Crawler::permitted(const Url& url) {
         auto response = co_await fetch(robots, options_.robots_request_timeout,
                                        options_.robots_transfer_timeout,
                                        kMaximumRobotsBytes);
-        if (!response)
-            co_return Permission{0, "robots.txt: no response", false};
+        if (!response) {
+            // An unavailable robots document is the same policy outcome as no
+            // robots document: allow every identity. Cache it in memory so a
+            // capsule outage does not cause one robots request per queued URL.
+            cache_robots(authority, {}, now + 24LL * 60 * 60 * 1000);
+            co_return Permission{0x1f, {}, false};
+        }
         fetched = true;
         const bool has_policy =
             response->error.empty() && response->status_code && *response->status_code == 20 &&
@@ -714,14 +724,12 @@ drogon::Task<Crawler::Permission> Crawler::permitted(const Url& url) {
         if (has_policy)
             source = response->body;
         co_await prepare_response(*response, url);
-        if (!response->error.empty())
-            co_return Permission{0,
-                                 "robots.txt: " + response->error,
-                                 false,
-                                 {},
-                                 std::move(response)};
-        co_await catalog_.record_host_success(url.host_key(), unix_millis());
+        if (response->error.empty())
+            co_await catalog_.record_host_success(url.host_key(), unix_millis());
         robots_response = std::move(response);
+        // Empty source is allow-all both for a missing/non-policy document and
+        // for a transport or size failure. Failed responses are recorded as
+        // history but process() deliberately does not persist them as policy.
         cache_robots(authority, source, now + 24LL * 60 * 60 * 1000);
     }
     const auto permissions = cached_robots_permissions(authority, url.path(), now);

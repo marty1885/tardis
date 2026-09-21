@@ -318,15 +318,15 @@ Mode is one of one of the following. URL components are percent-encoded path par
 /api/v1/updates/{mode}/{since_unix_millis}/{till_unix_millis}/mime/{change_mime_types}/body-mime/{body_mime_types}[/page/{paging_token}][/limit/{page_size}]
 ```
 
-This returns JSON page-change events, oldest first, after the supplied Unix millisecond cursor and at or before till_unix_millis. The upper bound makes a paged change run stable while new crawl results arrive. It is designed for search engines to learn which pages need reindexing without downloading every crawl. A page is emitted for its first eligible capture and thereafter only when its status, metadata, redirect state, or body changes; unchanged recrawls remain in archive history but are omitted. Results contain metadata, URLs, and the body digest and size, never body bytes. Limit defaults to 100 and accepts 1 through 1000.
+This returns JSON page-change events, oldest first, after the supplied Unix millisecond and at or before till_unix_millis. The upper bound makes a paged change run stable while new crawl results arrive. It is designed for search engines to learn which pages need reindexing without downloading every crawl. Each result has action upsert or remove. A page is upserted for its first eligible capture and thereafter only when its status, metadata, redirect state, or body changes. A remove tells that mode to remove the page from its current view when a new crawl makes it ineligible. It contains only the page URL and cursor identity, not the denied capture or an object. Historical archive retrieval remains independent and can still serve the last capture allowed for the mode. Unchanged recrawls remain in archive history but are omitted. Upserts contain metadata, URLs, and the body digest and size, never body bytes. Limit defaults to 100 and accepts 1 through 1000.
 
-Use the body digest to avoid fetching a representation already held by the client. A changed body can be fetched through the batch-fetch endpoint below.
+Use the body digest to avoid fetching data already held by the client. A changed body can be fetched through the batch-fetch endpoint below.
 
-The required change_mime_types segment is a percent-encoded comma-separated list of MIME types that selects page-change events before paging. The required body_mime_types segment independently selects which archived bodies are placed in the batch WARC. This lets an indexer learn that images exist while downloading only text bodies. Redirect results with a resolved target are always included so an indexer can update URL mappings.
+The required change_mime_types segment is a percent-encoded comma-separated list of MIME types that selects upserts before paging. Remove events always pass this filter so a client cannot retain a page which is no longer eligible. The required body_mime_types segment independently selects which archived bodies are placed in the batch WARC. This lets an indexer learn that images exist while downloading only text bodies. Redirect results with a resolved target are always included so an indexer can update URL mappings.
 
 Every Gemini 30 or 31 redirect response additionally creates redirect_chain in the event. It is resolved at the feed's till_unix_millis watermark, so all hops use one stable archive view. redirect_chain.hops contains the redirect hops and its terminal capture; final_url being the terminal URL. All redirection fields are raw Gemini redirect reference received from the origin and may be relative or not caonicalized. For an incomplete chain, final_url is likewise the last raw redirect reference. verdict indicates if the redirection is considered perament in Gemini semantics - only when all hops in the redirection chain are Gemini status 31 is verdict permanent. A non-complete resolution has verdict unknown. At most 16 redirect hops are followed. Gemini 32 and 33 responses are not treated as redirects.
 
-Each batch-manifest result reports body_state: included, excluded_by_body_mime, or unavailable. A body filter which matches no stored body is valid: the batch remains a manifest-only WARC response.
+Each batch-manifest result reports body_state: included, excluded_by_body_mime, unavailable, or removed. Remove events never produce a WARC body. A body filter which matches no stored body is valid: the batch remains a manifest-only WARC response.
 
 Example MIME filter:
 
@@ -342,6 +342,7 @@ Example response:
   "since_unix_millis": 1767225600000,
   "till_unix_millis": 1767225800000,
   "results": [{
+    "action": "upsert",
     "crawl_result_id": 42,
     "url": "gemini://example.org/notes.gmi",
     "started_at_unix_millis": 1767225700000,
@@ -356,6 +357,17 @@ Example response:
   "batch_token": "b0.1767225600000.1767225800000.archive.7d18a49894551b6c.746578742f67656d696e692c746578742f706c61696e2c696d6167652f706e67.746578742f67656d696e692c746578742f706c61696e.-.1767225600000.0.1767225700456.42",
   "next_page_token": "p0.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42",
   "resume_token": "p0.1767225600000.1767225800000.archive.7d18a49894551b6c.-.1767225700456.42"
+}
+```
+
+A removal result is much simpler. Note that to prevent loosing content, the removel event is only issued when the content has became non-crawlable due to a new robots policy and the page has been recrawled. Which should be very rare.
+
+```Example removal event
+{
+  "action": "remove",
+  "crawl_result_id": 43,
+  "url": "gemini://example.org/notes.gmi",
+  "committed_at_unix_millis": 1767225750000
 }
 ```
 

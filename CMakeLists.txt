@@ -85,11 +85,11 @@ target_link_libraries(tardis_sandbox PUBLIC tardis_minijail ${SECCOMP_LIBRARY})
 set_target_properties(tardis_sandbox PROPERTIES C_STANDARD 17 C_EXTENSIONS ON)
 
 add_executable(tardis src/main.cpp src/home_controller.cpp src/archive_link_rewrite.cpp
-                    src/object_store.cpp)
-target_include_directories(tardis PRIVATE src)
+                    src/sqlite_step_profile.cpp src/object_store.cpp)
+target_include_directories(tardis PRIVATE src ${SQLite3_INCLUDE_DIRS})
 target_link_libraries(tardis PRIVATE tardis_catalog tardis_api_clients dremini tlgs_url
                                          tardis_sandbox Drogon::Drogon ${TARDIS_SQLITE3_LIBRARY}
-                                         ${SODIUM_LIBRARY} ${ZSTD_LIBRARY})
+                                         ${SODIUM_LIBRARY} ${ZSTD_LIBRARY} ${CMAKE_DL_LIBS})
 target_link_options(tardis PRIVATE "LINKER:--wrap=landlock_create_ruleset"
                     "LINKER:--wrap=landlock_restrict_self")
 

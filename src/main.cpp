@@ -11,6 +11,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
@@ -38,6 +39,19 @@
 namespace {
 using tardis::CrawlResult;
 using tardis::Use;
+
+bool update_profiling_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("TARDIS_UPDATE_PROFILE");
+        return value && *value && std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+double elapsed_milliseconds(std::chrono::steady_clock::time_point begin,
+                            std::chrono::steady_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - begin).count();
+}
 
 std::string hex(std::span<const std::byte> bytes);
 
@@ -111,6 +125,22 @@ Json::Value metadata(const CrawlResult& result) {
         value["body_bytes"] = Json::Int64(result.object->raw_bytes);
         value["body_blake2b_256"] = hex(result.object->blake2b_256);
     }
+    return value;
+}
+
+Json::Value incremental_metadata(const CrawlResult& result) {
+    if (!result.incremental_removal) {
+        auto value = metadata(result);
+        value["action"] = "upsert";
+        return value;
+    }
+    // The denied capture is only the event cursor. Do not expose it as an
+    // object which a client might mistake for the current representation.
+    Json::Value value(Json::objectValue);
+    value["action"] = "remove";
+    value["crawl_result_id"] = Json::Int64(result.crawl_result_id);
+    value["url"] = result.crawling_url;
+    value["committed_at_unix_millis"] = Json::Int64(result.committed_at_unix_millis);
     return value;
 }
 
@@ -258,8 +288,7 @@ drogon::HttpResponsePtr archive_history_response(
     return response;
 }
 
-std::string read_body(const tardis::ObjectStore& objects, const tardis::Object& object) {
-    auto body = objects.get(object.blake2b_256, object.raw_bytes);
+void verify_body(const tardis::Object& object, std::string_view body) {
     std::array<unsigned char, 32> actual{};
     if (crypto_generichash_blake2b(actual.data(), actual.size(),
                                    reinterpret_cast<const unsigned char*>(body.data()), body.size(),
@@ -268,6 +297,11 @@ std::string read_body(const tardis::ObjectStore& objects, const tardis::Object& 
     for (std::size_t i = 0; i < actual.size(); ++i)
         if (actual[i] != std::to_integer<unsigned char>(object.blake2b_256[i]))
             throw std::runtime_error("archived body hash disagrees with catalog");
+}
+
+std::string read_body(const tardis::ObjectStore& objects, const tardis::Object& object) {
+    auto body = objects.get(object.blake2b_256, object.raw_bytes);
+    verify_body(object, body);
     return body;
 }
 
@@ -537,6 +571,7 @@ std::optional<BatchPaging> parse_batch_token(std::string_view token) {
 }
 
 bool body_matches_mime_filter(const CrawlResult& result, const std::vector<std::string>& mime_types) {
+    if (result.incremental_removal) return false;
     if (!result.object || mime_types.empty()) return result.object.has_value();
     const auto type = tardis::MediaType::parse(result.meta.value_or(""));
     if (!type) return false;
@@ -665,6 +700,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                            maximum_body_bytes]() mutable
                               -> drogon::Task<void> {
             try {
+                const auto request_started = std::chrono::steady_clock::now();
                 if (till < since) {
                     reply(error_response(drogon::k400BadRequest,
                                          "till_unix_millis must be at least since_unix_millis"));
@@ -691,7 +727,7 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     }
                     cursor = paging->cursor;
                 }
-                std::size_t limit = 100;
+                std::size_t limit = 500;
                 if (limit_value) {
                     if (*limit_value < 1 || *limit_value > 1000) {
                         reply(error_response(drogon::k400BadRequest, "limit must be 1..1000"));
@@ -699,20 +735,30 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     }
                     limit = static_cast<std::size_t>(*limit_value);
                 }
+                const auto catalog_started = std::chrono::steady_clock::now();
                 auto results = co_await self->catalog_.since(
                     cursor, till, *use, limit + 1, mime_types, maximum_body_bytes);
+                const auto catalog_finished = std::chrono::steady_clock::now();
                 const bool more = results.size() > limit;
                 if (more) results.pop_back();
+                std::vector<std::int64_t> redirect_targets;
+                for (const auto& result : results)
+                    if (!result.incremental_removal && is_gemini_redirect(result))
+                        redirect_targets.push_back(*result.redirected_to_page_id);
+                const auto redirect_chains = co_await self->catalog_.redirect_chains(
+                    redirect_targets, *use, till);
+                const auto redirects_finished = std::chrono::steady_clock::now();
                 Json::Value body(Json::objectValue);
                 body["mode"] = mode_name;
                 body["since_unix_millis"] = Json::Int64(since);
                 body["till_unix_millis"] = Json::Int64(till);
                 Json::Value items(Json::arrayValue);
+                std::size_t redirect_index{};
                 for (const auto& result : results) {
-                    auto item = metadata(result);
-                    if (is_gemini_redirect(result))
-                        item["redirect_chain"] = co_await self->resolve_redirect_chain(
-                            result, *use, till);
+                    auto item = incremental_metadata(result);
+                    if (!result.incremental_removal && is_gemini_redirect(result))
+                        item["redirect_chain"] = self->resolve_redirect_chain(
+                            result, redirect_chains.at(redirect_index++));
                     items.append(std::move(item));
                 }
                 body["results"] = std::move(items);
@@ -730,7 +776,25 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                         since, till, mode_name, filter_id, mime_types, body_mime_types, maximum_body_bytes, cursor,
                         {results.back().committed_at_unix_millis, results.back().crawl_result_id});
                 else body["batch_token"] = Json::nullValue;
-                reply(json_response(std::move(body)));
+                auto response = json_response(std::move(body));
+                const auto response_finished = std::chrono::steady_clock::now();
+                if (update_profiling_enabled()) {
+                    std::cerr << std::fixed << std::setprecision(3)
+                              << "tardis update performance"
+                              << " total_ms="
+                              << elapsed_milliseconds(request_started, response_finished)
+                              << " setup_ms="
+                              << elapsed_milliseconds(request_started, catalog_started)
+                              << " catalog_ms="
+                              << elapsed_milliseconds(catalog_started, catalog_finished)
+                              << " redirects_ms="
+                              << elapsed_milliseconds(catalog_finished, redirects_finished)
+                              << " format_ms="
+                              << elapsed_milliseconds(redirects_finished, response_finished)
+                              << " results=" << results.size()
+                              << " redirect_roots=" << redirect_targets.size() << '\n';
+                }
+                reply(response);
             } catch (const std::exception& error) {
                 std::cerr << "tardis: API updates request failed: " << error.what() << '\n';
                 reply(error_response(drogon::k500InternalServerError, "internal error"));
@@ -758,6 +822,10 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                     batch->maximum_body_bytes, batch->last);
                 std::vector<std::pair<CrawlResult, std::string>> records;
                 records.reserve(candidates.size());
+                std::vector<tardis::Object> requested_bodies;
+                std::vector<std::size_t> body_record_indices;
+                requested_bodies.reserve(candidates.size());
+                body_record_indices.reserve(candidates.size());
                 constexpr std::size_t maximum_body_bytes = 64U * 1024U * 1024U;
                 std::size_t body_bytes{};
                 for (const auto& result : candidates) {
@@ -769,10 +837,16 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                         const auto raw_bytes = static_cast<std::uint64_t>(result.object->raw_bytes);
                         if (!records.empty() && raw_bytes > maximum_body_bytes - body_bytes)
                             break;
-                        body = read_body(self->objects_, *result.object);
-                        body_bytes += body.size();
+                        requested_bodies.push_back(*result.object);
+                        body_record_indices.push_back(records.size());
+                        body_bytes += raw_bytes;
                     }
                     records.emplace_back(result, std::move(body));
+                }
+                auto bodies = self->objects_.get_many(requested_bodies);
+                for (std::size_t index = 0; index < bodies.size(); ++index) {
+                    verify_body(requested_bodies[index], bodies[index]);
+                    records[body_record_indices[index]].second = std::move(bodies[index]);
                 }
                 if (records.empty()) {
                     reply(error_response(drogon::k404NotFound, "batch is unavailable"));
@@ -798,8 +872,10 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 else manifest["next_batch_token"] = Json::nullValue;
                 Json::Value items(Json::arrayValue);
                 for (const auto& [result, body] : records) {
-                    auto item = metadata(result);
-                    if (body_matches_mime_filter(result, batch->body_mime_types)) {
+                    auto item = incremental_metadata(result);
+                    if (result.incremental_removal) {
+                        item["body_state"] = "removed";
+                    } else if (body_matches_mime_filter(result, batch->body_mime_types)) {
                         item["body_state"] = "included";
                         item["warc_target_uri"] = warc_target_uri(result.crawling_url);
                     } else if (result.object) item["body_state"] = "excluded_by_body_mime";
@@ -920,10 +996,10 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
         return response;
     }
 
-    // Resolves against one feed watermark. Target pages are addressed by ID,
-    // so every additional hop is an indexed page-history lookup.
-    drogon::Task<Json::Value> resolve_redirect_chain(const CrawlResult& first, Use use,
-                                                     std::int64_t as_of_unix_millis) {
+    // The catalog fetches all chains in one recursive query. This formatter
+    // retains the API's cycle, missing-target, and depth-limit semantics.
+    Json::Value resolve_redirect_chain(const CrawlResult& first,
+                                       const std::vector<CrawlResult>& chain) const {
         constexpr std::size_t maximum_redirect_hops = 16;
         Json::Value value(Json::objectValue);
         Json::Value hops(Json::arrayValue);
@@ -942,37 +1018,37 @@ class ApiService : public std::enable_shared_from_this<ApiService> {
                 value["final_url"] = raw_target;
                 value["verdict"] = "unknown";
                 value["hops"] = std::move(hops);
-                co_return value;
+                return value;
             }
 
-            const auto next = co_await catalog_.retrieve_page(target_id, use, as_of_unix_millis);
-            if (!next) {
+            if (depth >= chain.size()) {
                 value["resolution"] = "unresolved_target";
                 value["final_url"] = raw_target;
                 value["verdict"] = "unknown";
                 value["hops"] = std::move(hops);
-                co_return value;
+                return value;
             }
-            if (!is_gemini_redirect(*next)) {
+            const auto& next = chain[depth];
+            if (!is_gemini_redirect(next)) {
                 Json::Value terminal(Json::objectValue);
-                terminal["crawl_result_id"] = Json::Int64(next->crawl_result_id);
-                terminal["url"] = next->crawling_url;
-                if (next->status_code) terminal["status_code"] = *next->status_code;
+                terminal["crawl_result_id"] = Json::Int64(next.crawl_result_id);
+                terminal["url"] = next.crawling_url;
+                if (next.status_code) terminal["status_code"] = *next.status_code;
                 hops.append(std::move(terminal));
                 value["resolution"] = "complete";
-                value["final_url"] = next->crawling_url;
+                value["final_url"] = next.crawling_url;
                 value["verdict"] = temporary ? "temporary" : "permanent";
                 value["hops"] = std::move(hops);
-                co_return value;
+                return value;
             }
-            current = *next;
+            current = next;
         }
 
         value["resolution"] = "depth_limit";
         value["final_url"] = redirect_reference(current);
         value["verdict"] = "unknown";
         value["hops"] = std::move(hops);
-        co_return value;
+        return value;
     }
 
     tardis::Catalog& catalog_;

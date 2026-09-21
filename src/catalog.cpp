@@ -13,6 +13,7 @@ namespace {
 
 constexpr std::size_t kMaximumPageSize = 1001;
 constexpr std::size_t kMaximumMetaBytes = 1024;
+constexpr std::int64_t kCatalogMmapBytes = 256LL * 1024 * 1024;
 
 Hash256 hash_from_blob(const std::vector<char>& blob) {
     if (blob.size() != Hash256{}.size())
@@ -142,7 +143,7 @@ drogon::Task<void> refresh_host_queue_time(const drogon::orm::DbClientPtr& clien
         host_id, host_id);
 }
 
-CrawlResult decode_result(const drogon::orm::Row& row) {
+CrawlResult decode_result(const drogon::orm::Row& row, bool include_certificate_bytes = false) {
     CrawlResult result;
     result.crawl_result_id = row["crawl_result_id"].as<std::int64_t>();
     result.page_id = row["page_id"].as<std::int64_t>();
@@ -164,9 +165,11 @@ CrawlResult decode_result(const drogon::orm::Row& row) {
     if (!row["certificate_hash"].isNull()) {
         Certificate certificate;
         certificate.blake2b_256 = hash_from_blob(row["certificate_hash"].as<std::vector<char>>());
-        const auto bytes = row["certificate_bytes"].as<std::vector<char>>();
-        certificate.bytes.assign(bytes.begin(), bytes.end());
-        certificate.pkix_verified = row["certificate_pkix_verified"].as<bool>();
+        if (include_certificate_bytes) {
+            const auto bytes = row["certificate_bytes"].as<std::vector<char>>();
+            certificate.bytes.assign(bytes.begin(), bytes.end());
+            certificate.pkix_verified = row["certificate_pkix_verified"].as<bool>();
+        }
         result.certificate = std::move(certificate);
     }
     if (!row["object_hash"].isNull()) {
@@ -179,6 +182,32 @@ CrawlResult decode_result(const drogon::orm::Row& row) {
 }
 
 constexpr std::string_view kResultProjection = R"sql(
+SELECT cr.crawl_result_id,
+       cr.page_id,
+       p.url AS crawling_url,
+       redirected.url AS redirected_to,
+       cr.redirected_to_page_id,
+       cr.redirect_count,
+       cr.started_at_unix_millis,
+       cr.ended_at_unix_millis,
+       cr.committed_at_unix_millis,
+       cr.status_code,
+       cr.robots_bitfield,
+       cr.meta,
+       certificates.blake2b_256 AS certificate_hash,
+       objects.blake2b_256 AS object_hash,
+       objects.raw_bytes
+FROM crawl_results AS cr
+JOIN pages AS p ON p.page_id = cr.page_id
+LEFT JOIN pages AS redirected ON redirected.page_id = cr.redirected_to_page_id
+LEFT JOIN certificates ON certificates.certificate_id = cr.certificate_id
+LEFT JOIN objects ON objects.object_id = cr.object_id
+)sql";
+
+// Certificate DER is needed by full-capture retrieval and catalog history.
+// Keep the high-volume feed, batch, and redirect queries from reading and
+// copying it merely to report the certificate digest.
+constexpr std::string_view kResultProjectionWithCertificate = R"sql(
 SELECT cr.crawl_result_id,
        cr.page_id,
        p.url AS crawling_url,
@@ -239,6 +268,7 @@ void Catalog::open(bool recover_claims) {
         reader_->execSqlSync("PRAGMA foreign_keys=ON");
         reader_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
         reader_->execSqlSync("PRAGMA temp_store=MEMORY");
+        reader_->execSqlSync("PRAGMA mmap_size=" + std::to_string(kCatalogMmapBytes));
         return;
     }
 
@@ -255,6 +285,7 @@ void Catalog::open(bool recover_claims) {
     reader_->execSqlSync("PRAGMA foreign_keys=ON");
     reader_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
     reader_->execSqlSync("PRAGMA temp_store=MEMORY");
+    reader_->execSqlSync("PRAGMA mmap_size=" + std::to_string(kCatalogMmapBytes));
 
     const char* statements[] = {
         R"sql(CREATE TABLE IF NOT EXISTS snapshot_meta (
@@ -310,6 +341,8 @@ void Catalog::open(bool recover_claims) {
             committed_at_unix_millis INTEGER NOT NULL,
             status_code INTEGER,
             robots_bitfield INTEGER NOT NULL CHECK(robots_bitfield BETWEEN 0 AND 31),
+            update_bitfield INTEGER NOT NULL DEFAULT 0
+                CHECK(update_bitfield BETWEEN 0 AND 31),
             object_id INTEGER REFERENCES objects(object_id),
             meta TEXT
         ) STRICT)sql",
@@ -334,9 +367,6 @@ void Catalog::open(bool recover_claims) {
         R"sql(CREATE INDEX IF NOT EXISTS crawl_results_by_page_commit
             ON crawl_results(page_id, committed_at_unix_millis DESC,
                              crawl_result_id DESC))sql",
-        R"sql(CREATE INDEX IF NOT EXISTS crawl_results_since
-            ON crawl_results(committed_at_unix_millis, crawl_result_id,
-                             robots_bitfield))sql",
         R"sql(CREATE TABLE IF NOT EXISTS archive_statistics (
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             archived_pages INTEGER NOT NULL CHECK(archived_pages >= 0),
@@ -412,6 +442,125 @@ void Catalog::open(bool recover_claims) {
         ) STRICT)sql",
     };
     for (const auto* statement : statements) writer_->execSqlSync(statement);
+    // Incremental feeds use the smaller per-mode partial indexes below. The
+    // former all-captures index only adds write, WAL, and cache pressure.
+    writer_->execSqlSync("DROP INDEX IF EXISTS crawl_results_since");
+    const auto crawl_result_columns = writer_->execSqlSync("PRAGMA table_info(crawl_results)");
+    bool has_update_bitfield = false;
+    for (const auto& column : crawl_result_columns)
+        if (column["name"].as<std::string>() == "update_bitfield") {
+            has_update_bitfield = true;
+            break;
+        }
+    if (!has_update_bitfield)
+        writer_->execSqlSync(
+            "ALTER TABLE crawl_results ADD COLUMN update_bitfield INTEGER NOT NULL DEFAULT 0 "
+            "CHECK(update_bitfield BETWEEN 0 AND 31)");
+
+    // Materialize the modes for which each capture is an incremental event.
+    // The existing robots bit says whether that event is an upsert or removal.
+    // This runs after crawl_results_by_page_commit exists, and the marker is
+    // committed atomically with the backfill so an interruption is harmless.
+    const auto incremental_backfill = writer_->execSqlSync(
+        "SELECT 1 FROM snapshot_meta WHERE key='incremental_updates_v1' LIMIT 1");
+    if (incremental_backfill.empty()) {
+        writer_->execSqlSync("BEGIN IMMEDIATE");
+        try {
+            writer_->execSqlSync(R"sql(
+                WITH ordered AS (
+                    SELECT crawl_result_id,robots_bitfield,status_code,
+                           redirected_to_page_id,redirect_count,object_id,meta,
+                           lag(crawl_result_id) OVER history AS previous_id,
+                           lag(robots_bitfield,1,0) OVER history AS previous_robots,
+                           lag(status_code) OVER history AS previous_status,
+                           lag(redirected_to_page_id) OVER history AS previous_redirect,
+                           lag(redirect_count) OVER history AS previous_redirect_count,
+                           lag(object_id) OVER history AS previous_object,
+                           lag(meta) OVER history AS previous_meta
+                    FROM crawl_results
+                    WINDOW history AS (
+                        PARTITION BY page_id
+                        ORDER BY committed_at_unix_millis,crawl_result_id)
+                ), states AS (
+                    SELECT crawl_result_id,
+                           CASE WHEN previous_id IS NULL THEN robots_bitfield
+                           ELSE (
+                               (robots_bitfield & ~previous_robots) |
+                               (previous_robots & ~robots_bitfield) |
+                               CASE WHEN NOT (
+                                   status_code IS previous_status AND
+                                   redirected_to_page_id IS previous_redirect AND
+                                   redirect_count = previous_redirect_count AND
+                                   object_id IS previous_object AND
+                                   meta IS previous_meta)
+                               THEN (robots_bitfield & previous_robots) ELSE 0 END
+                           ) & 31 END AS update_bitfield
+                    FROM ordered
+                )
+                UPDATE crawl_results AS target
+                SET update_bitfield=states.update_bitfield
+                FROM states
+                WHERE states.crawl_result_id=target.crawl_result_id
+            )sql");
+            writer_->execSqlSync(
+                "INSERT INTO snapshot_meta(key,value) VALUES"
+                "('incremental_updates_v1','complete')");
+            writer_->execSqlSync("COMMIT");
+        } catch (...) {
+            writer_->execSqlSync("ROLLBACK");
+            throw;
+        }
+    }
+    writer_->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS crawl_results_updates_tlgs "
+        "ON crawl_results(committed_at_unix_millis,crawl_result_id) "
+        "WHERE (update_bitfield & 1) != 0");
+    writer_->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS crawl_results_updates_indexer "
+        "ON crawl_results(committed_at_unix_millis,crawl_result_id) "
+        "WHERE (update_bitfield & 2) != 0");
+    writer_->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS crawl_results_updates_archiver "
+        "ON crawl_results(committed_at_unix_millis,crawl_result_id) "
+        "WHERE (update_bitfield & 4) != 0");
+    writer_->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS crawl_results_updates_researcher "
+        "ON crawl_results(committed_at_unix_millis,crawl_result_id) "
+        "WHERE (update_bitfield & 8) != 0");
+    writer_->execSqlSync(
+        "CREATE INDEX IF NOT EXISTS crawl_results_updates_webproxy "
+        "ON crawl_results(committed_at_unix_millis,crawl_result_id) "
+        "WHERE (update_bitfield & 16) != 0");
+    writer_->execSqlSync("DROP TRIGGER IF EXISTS record_incremental_update");
+    writer_->execSqlSync(R"sql(
+        CREATE TRIGGER record_incremental_update
+        AFTER INSERT ON crawl_results
+        BEGIN
+            UPDATE crawl_results
+            SET update_bitfield=coalesce((
+                SELECT (
+                    (NEW.robots_bitfield & ~previous.robots_bitfield) |
+                    (previous.robots_bitfield & ~NEW.robots_bitfield) |
+                    CASE WHEN NOT (
+                        NEW.status_code IS previous.status_code AND
+                        NEW.redirected_to_page_id IS previous.redirected_to_page_id AND
+                        NEW.redirect_count = previous.redirect_count AND
+                        NEW.object_id IS previous.object_id AND
+                        NEW.meta IS previous.meta)
+                    THEN (NEW.robots_bitfield & previous.robots_bitfield) ELSE 0 END
+                ) & 31
+                FROM crawl_results AS previous
+                WHERE previous.page_id=NEW.page_id
+                  AND (previous.committed_at_unix_millis < NEW.committed_at_unix_millis OR
+                       (previous.committed_at_unix_millis = NEW.committed_at_unix_millis AND
+                        previous.crawl_result_id < NEW.crawl_result_id))
+                ORDER BY previous.committed_at_unix_millis DESC,
+                         previous.crawl_result_id DESC
+                LIMIT 1
+            ), NEW.robots_bitfield)
+            WHERE crawl_result_id=NEW.crawl_result_id;
+        END
+    )sql");
     const auto certificate_columns = writer_->execSqlSync("PRAGMA table_info(certificates)");
     bool has_pkix_verified = false;
     for (const auto& column : certificate_columns)
@@ -604,6 +753,10 @@ void Catalog::open_for_submission() {
     reader_->execSqlSync("PRAGMA foreign_keys=ON");
     reader_->execSqlSync("PRAGMA busy_timeout=" + std::to_string(write_timeout_millis_));
     reader_->execSqlSync("PRAGMA temp_store=MEMORY");
+    // Serving uses one catalog reader, so this connection-local setting covers
+    // every incremental-feed query. SQLite silently clamps it to its compiled
+    // maximum (or zero on platforms without mmap support).
+    reader_->execSqlSync("PRAGMA mmap_size=" + std::to_string(kCatalogMmapBytes));
 }
 
 drogon::Task<std::vector<CrawlResult>> Catalog::archive(std::string_view canonical_url, Use use,
@@ -612,7 +765,7 @@ drogon::Task<std::vector<CrawlResult>> Catalog::archive(std::string_view canonic
     if (!reader_)
         throw std::logic_error("catalog is not open");
     limit = std::clamp<std::size_t>(limit, 1, kMaximumPageSize);
-    const auto sql = std::string(kResultProjection) +
+    const auto sql = std::string(kResultProjectionWithCertificate) +
                      R"sql(
 WHERE p.url = ? AND (cr.robots_bitfield & ?) != 0
   AND (? = 0 OR cr.started_at_unix_millis < ? OR
@@ -626,7 +779,7 @@ LIMIT ?)sql";
         static_cast<std::int64_t>(limit));
     std::vector<CrawlResult> results;
     results.reserve(rows.size());
-    for (const auto& row : rows) results.push_back(decode_result(row));
+    for (const auto& row : rows) results.push_back(decode_result(row, true));
     co_return results;
 }
 
@@ -657,40 +810,21 @@ drogon::Task<std::vector<CrawlResult>> Catalog::since(SinceCursor after,
     if (!reader_)
         throw std::logic_error("catalog is not open");
     limit = std::clamp<std::size_t>(limit, 1, kMaximumPageSize);
+    const auto bit = use_bit(use);
     auto sql = std::string(kResultProjection) + R"sql(
-WHERE (cr.committed_at_unix_millis > ? OR
-       (cr.committed_at_unix_millis = ? AND cr.crawl_result_id > ?))
-  AND (cr.robots_bitfield & ?) != 0
-  AND cr.committed_at_unix_millis <= ?
-  AND (? = 0 OR cr.committed_at_unix_millis < ? OR
-       (cr.committed_at_unix_millis = ? AND cr.crawl_result_id <= ?))
-  -- A crawl is historical even when it found the same representation, but
-  -- search clients only need the first eligible capture and subsequent
-  -- changes.  Compare against this use's previous eligible capture: a page
-  -- that becomes visible to a new use must still be announced.
-  AND NOT EXISTS (
-      SELECT 1
-      FROM crawl_results AS previous
-      WHERE previous.crawl_result_id = (
-          SELECT earlier.crawl_result_id
-          FROM crawl_results AS earlier
-          WHERE earlier.page_id = cr.page_id
-            AND (earlier.robots_bitfield & ?) != 0
-            AND (earlier.committed_at_unix_millis < cr.committed_at_unix_millis OR
-                 (earlier.committed_at_unix_millis = cr.committed_at_unix_millis AND
-                  earlier.crawl_result_id < cr.crawl_result_id))
-          ORDER BY earlier.committed_at_unix_millis DESC, earlier.crawl_result_id DESC
-          LIMIT 1
-      )
-        AND previous.status_code IS cr.status_code
-        AND previous.redirected_to_page_id IS cr.redirected_to_page_id
-        AND previous.redirect_count = cr.redirect_count
-        AND previous.object_id IS cr.object_id
-        AND previous.meta IS cr.meta
-  )
+WHERE (cr.committed_at_unix_millis,cr.crawl_result_id) > (?,?)
 )sql";
+    // Keep the mode bit literal so SQLite can select the matching partial
+    // index. A bound parameter does not imply a partial-index predicate.
+    sql += "  AND (cr.update_bitfield & " + std::to_string(bit) + ") != 0\n";
+    sql += "  AND cr.committed_at_unix_millis <= ?\n";
+    if (through_cursor)
+        sql += "  AND (cr.committed_at_unix_millis,cr.crawl_result_id) <= (?,?)\n";
     if (!mime_types.empty() && std::find(mime_types.begin(), mime_types.end(), "*") == mime_types.end()) {
-        sql += " AND ((cr.status_code BETWEEN 30 AND 39 AND cr.redirected_to_page_id IS NOT NULL) OR (";
+        // A removal must reach the client regardless of the representation
+        // that caused it. MIME filtering applies only to upserts.
+        sql += " AND (((cr.robots_bitfield & " + std::to_string(bit) + ") = 0) OR "
+               "(cr.status_code BETWEEN 30 AND 39 AND cr.redirected_to_page_id IS NOT NULL) OR (";
         for (std::size_t index = 0; index < mime_types.size(); ++index) {
             if (index) sql += " OR ";
             sql += "lower(trim(substr(coalesce(cr.meta,''),1,"
@@ -698,17 +832,17 @@ WHERE (cr.committed_at_unix_millis > ? OR
         }
         sql += "))";
     }
-    if (maximum_body_bytes) sql += " AND (objects.raw_bytes IS NULL OR objects.raw_bytes <= ?)";
+    if (maximum_body_bytes)
+        sql += " AND (((cr.robots_bitfield & " + std::to_string(bit) +
+               ") = 0) OR objects.raw_bytes IS NULL OR objects.raw_bytes <= ?)";
     sql += R"sql(
 ORDER BY cr.committed_at_unix_millis, cr.crawl_result_id
 LIMIT ?)sql";
     std::optional<drogon::orm::Result> rows;
-    const auto cursor_limit = through_cursor.value_or(SinceCursor{});
     auto binder = *reader_ << sql;
-    binder << after.committed_at_unix_millis << after.committed_at_unix_millis
-           << after.crawl_result_id << use_bit(use) << through_unix_millis
-           << (through_cursor ? 1 : 0) << cursor_limit.committed_at_unix_millis
-           << cursor_limit.committed_at_unix_millis << cursor_limit.crawl_result_id << use_bit(use);
+    binder << after.committed_at_unix_millis << after.crawl_result_id << through_unix_millis;
+    if (through_cursor)
+        binder << through_cursor->committed_at_unix_millis << through_cursor->crawl_result_id;
     if (std::find(mime_types.begin(), mime_types.end(), "*") == mime_types.end())
         for (const auto& mime : mime_types) binder << mime;
     if (maximum_body_bytes) binder << *maximum_body_bytes;
@@ -716,7 +850,11 @@ LIMIT ?)sql";
     rows.emplace(co_await drogon::orm::internal::SqlAwaiter(std::move(binder)));
     std::vector<CrawlResult> results;
     results.reserve(rows->size());
-    for (const auto& row : *rows) results.push_back(decode_result(row));
+    for (const auto& row : *rows) {
+        auto result = decode_result(row);
+        result.incremental_removal = (result.robots_bitfield & bit) == 0;
+        results.push_back(std::move(result));
+    }
     co_return results;
 }
 
@@ -725,7 +863,7 @@ drogon::Task<std::optional<CrawlResult>> Catalog::retrieve(
     std::optional<std::int64_t> as_of_unix_millis) {
     if (!reader_)
         throw std::logic_error("catalog is not open");
-    const auto sql = std::string(kResultProjection) +
+    const auto sql = std::string(kResultProjectionWithCertificate) +
                      R"sql(
 WHERE p.url = ? AND (cr.robots_bitfield & ?) != 0
   AND (? = 0 OR cr.committed_at_unix_millis <= ?)
@@ -736,7 +874,7 @@ LIMIT 1)sql";
         as_of_unix_millis.value_or(0));
     if (rows.empty())
         co_return std::nullopt;
-    co_return decode_result(rows.front());
+    co_return decode_result(rows.front(), true);
 }
 
 drogon::Task<std::optional<CrawlResult>> Catalog::retrieve_page(
@@ -755,6 +893,96 @@ LIMIT 1)sql";
     if (rows.empty())
         co_return std::nullopt;
     co_return decode_result(rows.front());
+}
+
+drogon::Task<std::vector<std::vector<CrawlResult>>> Catalog::redirect_chains(
+    const std::vector<std::int64_t>& target_page_ids, Use use,
+    std::int64_t as_of_unix_millis, std::size_t maximum_hops) {
+    if (!reader_)
+        throw std::logic_error("catalog is not open");
+    if (target_page_ids.empty())
+        co_return std::vector<std::vector<CrawlResult>>{};
+    maximum_hops = std::clamp<std::size_t>(maximum_hops, 1, 64);
+
+    Json::Value targets(Json::arrayValue);
+    for (const auto page_id : target_page_ids)
+        targets.append(Json::Int64(page_id));
+    Json::StreamWriterBuilder writer;
+    writer["indentation"] = "";
+    const auto encoded_targets = Json::writeString(writer, targets);
+
+    // Start every chain from its first redirect target, then follow the newest
+    // eligible capture at the shared feed watermark. Cycles deliberately run
+    // only to maximum_hops; the caller classifies them while formatting.
+    const auto rows = co_await reader_->execSqlCoro(R"sql(
+        WITH RECURSIVE
+        input(root,page_id) AS (
+            SELECT CAST(key AS INTEGER),CAST(value AS INTEGER) FROM json_each(?)
+        ),
+        chain(root,depth,crawl_result_id) AS (
+            SELECT input.root,0,(
+                SELECT candidate.crawl_result_id
+                FROM crawl_results AS candidate
+                WHERE candidate.page_id=input.page_id
+                  AND (candidate.robots_bitfield & ?) != 0
+                  AND candidate.committed_at_unix_millis <= ?
+                ORDER BY candidate.committed_at_unix_millis DESC,
+                         candidate.crawl_result_id DESC
+                LIMIT 1)
+            FROM input
+            UNION ALL
+            SELECT chain.root,chain.depth+1,(
+                SELECT candidate.crawl_result_id
+                FROM crawl_results AS candidate
+                WHERE candidate.page_id=current.redirected_to_page_id
+                  AND (candidate.robots_bitfield & ?) != 0
+                  AND candidate.committed_at_unix_millis <= ?
+                ORDER BY candidate.committed_at_unix_millis DESC,
+                         candidate.crawl_result_id DESC
+                LIMIT 1)
+            FROM chain
+            JOIN crawl_results AS current
+              ON current.crawl_result_id=chain.crawl_result_id
+            WHERE chain.crawl_result_id IS NOT NULL
+              AND current.status_code IN (30,31)
+              AND current.redirected_to_page_id IS NOT NULL
+              AND chain.depth+1 < ?
+        )
+        SELECT chain.root AS chain_root,
+               cr.crawl_result_id,
+               cr.page_id,
+               p.url AS crawling_url,
+               redirected.url AS redirected_to,
+               cr.redirected_to_page_id,
+               cr.redirect_count,
+               cr.started_at_unix_millis,
+               cr.ended_at_unix_millis,
+               cr.committed_at_unix_millis,
+               cr.status_code,
+               cr.robots_bitfield,
+               cr.meta,
+               certificates.blake2b_256 AS certificate_hash,
+               objects.blake2b_256 AS object_hash,
+               objects.raw_bytes
+        FROM chain
+        JOIN crawl_results AS cr ON cr.crawl_result_id=chain.crawl_result_id
+        JOIN pages AS p ON p.page_id=cr.page_id
+        LEFT JOIN pages AS redirected ON redirected.page_id=cr.redirected_to_page_id
+        LEFT JOIN certificates ON certificates.certificate_id=cr.certificate_id
+        LEFT JOIN objects ON objects.object_id=cr.object_id
+        WHERE chain.crawl_result_id IS NOT NULL
+        ORDER BY chain.root,chain.depth
+    )sql", encoded_targets, use_bit(use), as_of_unix_millis, use_bit(use),
+        as_of_unix_millis, static_cast<std::int64_t>(maximum_hops));
+
+    std::vector<std::vector<CrawlResult>> chains(target_page_ids.size());
+    for (const auto& row : rows) {
+        const auto root = row["chain_root"].as<std::size_t>();
+        if (root >= chains.size())
+            throw std::runtime_error("redirect chain has an invalid root");
+        chains[root].push_back(decode_result(row));
+    }
+    co_return chains;
 }
 
 drogon::Task<std::optional<CrawlResult>> Catalog::capture(std::string_view canonical_url,
@@ -886,6 +1114,7 @@ drogon::Task<std::int64_t> Catalog::append(NewCrawlResult result) {
         co_return rows[0]["page_id"].as<std::int64_t>();
     };
 
+    std::int64_t crawl_result_id{};
     try {
         const auto page_id = co_await ensure_page(result.crawling_page);
         std::optional<std::int64_t> redirected_to_page_id;
@@ -935,14 +1164,15 @@ drogon::Task<std::int64_t> Catalog::append(NewCrawlResult result) {
             page_id, redirected_to_page_id, result.redirect_count, certificate_id,
             result.started_at_unix_millis, result.ended_at_unix_millis, result.status_code,
             result.robots_bitfield, object_id, result.meta);
-        const auto crawl_result_id = inserted.insertId();
+        crawl_result_id = inserted.insertId();
         co_await transaction->execSqlCoro(
             "UPDATE pages SET latest_crawl_result_id=? WHERE page_id=?", crawl_result_id, page_id);
-        co_return crawl_result_id;
     } catch (...) {
         transaction->rollback();
         throw;
     }
+    co_await TransactionCommitAwaiter(std::move(transaction));
+    co_return crawl_result_id;
 }
 
 drogon::Task<bool> Catalog::contains_object(const Hash256& blake2b_256) {

@@ -38,6 +38,14 @@ int main() {
             sqlite3_close(db);
             throw std::runtime_error("open test catalog: " + error);
         }
+        sqlite3_stmt* obsolete_index = nullptr;
+        assert(sqlite3_prepare_v2(
+                   db,
+                   "SELECT 1 FROM sqlite_schema WHERE type='index' "
+                   "AND name='crawl_results_since'",
+                   -1, &obsolete_index, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(obsolete_index) == SQLITE_DONE);
+        sqlite3_finalize(obsolete_index);
         exec(db, R"sql(
             PRAGMA foreign_keys=ON;
             BEGIN IMMEDIATE;
@@ -95,24 +103,46 @@ int main() {
         assert(second_page.size() == 1 && second_page[0].crawl_result_id == 1);
 
         const auto feed = drogon::sync_wait(catalog.since({1100, 1}, 1500, tardis::Use::archiver));
-        assert(feed.empty());  // Capture 3 is the same eligible representation as capture 1.
+        assert(feed.size() == 2);
+        assert(feed[0].crawl_result_id == 2 && feed[0].incremental_removal);
+        // Capture 3 matches the older archive, but must be re-announced because
+        // capture 2 told this consumer to remove the page.
+        assert(feed[1].crawl_result_id == 3 && !feed[1].incremental_removal);
         const auto bounded_feed = drogon::sync_wait(catalog.since(
             {0, 0}, 1400, tardis::Use::archiver));
-        assert(bounded_feed.size() == 1 && bounded_feed[0].crawl_result_id == 1);
+        assert(bounded_feed.size() == 2 && bounded_feed[0].crawl_result_id == 1);
+        assert(!bounded_feed[0].incremental_removal);
+        assert(bounded_feed[1].crawl_result_id == 2 && bounded_feed[1].incremental_removal);
         const auto filtered = drogon::sync_wait(catalog.since(
             {0, 0}, 1500, tardis::Use::tlgs, 100, {"text/gemini"}));
-        assert(filtered.size() == 1 && filtered[0].crawl_result_id == 2);
+        assert(filtered.size() == 2 && filtered[0].crawl_result_id == 2);
+        assert(!filtered[0].incremental_removal);
         assert(filtered[0].redirected_to &&
                *filtered[0].redirected_to == "gemini://example.org/next");
         assert(filtered[0].redirected_to_page_id && *filtered[0].redirected_to_page_id == 2);
+        const auto redirect_chains = drogon::sync_wait(catalog.redirect_chains(
+            {1, 2}, tardis::Use::tlgs, 1300));
+        assert(redirect_chains.size() == 2);
+        assert(redirect_chains[0].size() == 1 &&
+               redirect_chains[0][0].crawl_result_id == 2);
+        assert(redirect_chains[1].empty());
+        const auto terminal_chain = drogon::sync_wait(catalog.redirect_chains(
+            {1}, tardis::Use::archiver, 1500));
+        assert(terminal_chain.size() == 1 && terminal_chain[0].size() == 1 &&
+               terminal_chain[0][0].crawl_result_id == 3);
+        // Removal events cannot be hidden by a MIME filter.
+        assert(filtered[1].crawl_result_id == 3 && filtered[1].incremental_removal);
         assert(!drogon::sync_wait(catalog.retrieve_page(2, tardis::Use::tlgs, 1500)));
         const auto size_filtered = drogon::sync_wait(catalog.since(
             {0, 0}, 1500, tardis::Use::archiver, 100, {}, 11));
-        assert(size_filtered.empty());
+        assert(size_filtered.size() == 1 && size_filtered[0].crawl_result_id == 2);
+        assert(size_filtered[0].incremental_removal);
         const auto size_filtered_with_bodyless_result = drogon::sync_wait(catalog.since(
             {0, 0}, 1500, tardis::Use::tlgs, 100, {}, 0));
-        assert(size_filtered_with_bodyless_result.size() == 1);
+        assert(size_filtered_with_bodyless_result.size() == 2);
         assert(size_filtered_with_bodyless_result[0].crawl_result_id == 2);
+        assert(size_filtered_with_bodyless_result[1].crawl_result_id == 3);
+        assert(size_filtered_with_bodyless_result[1].incremental_removal);
 
         const auto changed_feed = drogon::sync_wait(catalog.since(
             {1500, 3}, std::numeric_limits<std::int64_t>::max(), tardis::Use::archiver));
@@ -412,8 +442,8 @@ int main() {
         sqlite3_finalize(suppressed);
         sqlite3_close(pkix_db);
 
-        // Emulate an archive created before archive_statistics_v1. The next
-        // crawler-owned open must rebuild exact counters from crawl history.
+        // Emulate an archive created before these materialized migrations. The
+        // next crawler-owned open must rebuild exact state from crawl history.
         assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &db) == SQLITE_OK);
         exec(db, R"sql(
             DELETE FROM archive_statistics;
@@ -421,6 +451,9 @@ int main() {
             DELETE FROM archived_hosts;
             DELETE FROM archived_objects;
             DELETE FROM snapshot_meta WHERE key='archive_statistics_v1';
+            DROP TRIGGER record_incremental_update;
+            UPDATE crawl_results SET update_bitfield=0;
+            DELETE FROM snapshot_meta WHERE key='incremental_updates_v1';
         )sql");
         sqlite3_close(db);
     }
@@ -435,6 +468,47 @@ int main() {
         assert(recovered_archive_statistics.uncompressed_archive_bytes == 108);
         assert(recovered_archive_statistics.archive_hosts == 1);
         assert(recovered_archive_statistics.archive_objects == 2);
+        sqlite3* recovered_db = nullptr;
+        assert(sqlite3_open((snapshot / "catalog.sqlite3").c_str(), &recovered_db) == SQLITE_OK);
+        sqlite3_stmt* states = nullptr;
+        assert(sqlite3_prepare_v2(
+                   recovered_db,
+                   "SELECT update_bitfield FROM crawl_results WHERE crawl_result_id<=3 "
+                   "ORDER BY crawl_result_id",
+                   -1, &states, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(states) == SQLITE_ROW && sqlite3_column_int(states, 0) == 4);
+        assert(sqlite3_step(states) == SQLITE_ROW && sqlite3_column_int(states, 0) == 5);
+        assert(sqlite3_step(states) == SQLITE_ROW && sqlite3_column_int(states, 0) == 5);
+        assert(sqlite3_step(states) == SQLITE_DONE);
+        sqlite3_finalize(states);
+
+        sqlite3_stmt* plan = nullptr;
+        assert(sqlite3_prepare_v2(
+                   recovered_db,
+                   "EXPLAIN QUERY PLAN SELECT crawl_result_id FROM crawl_results "
+                   "WHERE (committed_at_unix_millis,crawl_result_id)>(?,?) "
+                   "AND (update_bitfield & 4) != 0 AND committed_at_unix_millis<=? "
+                   "ORDER BY committed_at_unix_millis,crawl_result_id LIMIT ?",
+                   -1, &plan, nullptr) == SQLITE_OK);
+        assert(sqlite3_bind_int64(plan, 1, 0) == SQLITE_OK);
+        assert(sqlite3_bind_int64(plan, 2, 0) == SQLITE_OK);
+        assert(sqlite3_bind_int64(plan, 3, std::numeric_limits<std::int64_t>::max()) == SQLITE_OK);
+        assert(sqlite3_bind_int64(plan, 4, 100) == SQLITE_OK);
+        bool uses_update_index = false;
+        bool uses_lower_bound = false;
+        while (sqlite3_step(plan) == SQLITE_ROW) {
+            const auto* detail = reinterpret_cast<const char*>(sqlite3_column_text(plan, 3));
+            if (detail) {
+                const std::string description(detail);
+                if (description.find("crawl_results_updates_archiver") != std::string::npos)
+                    uses_update_index = true;
+                if (description.find("committed_at_unix_millis>?") != std::string::npos)
+                    uses_lower_bound = true;
+            }
+        }
+        assert(uses_update_index && uses_lower_bound);
+        sqlite3_finalize(plan);
+        sqlite3_close(recovered_db);
         const tardis::PageAddress seed_page{"gemini://example.org/seed", "example.org"};
         assert(drogon::sync_wait(recovered.enqueue_seed_if_uncrawled(
             seed_page, std::numeric_limits<std::int64_t>::max())));

@@ -87,6 +87,9 @@ struct CrawlResult {
     std::int64_t committed_at_unix_millis{};
     std::optional<std::int16_t> status_code;
     std::uint16_t robots_bitfield{};
+    // Set only by incremental-feed queries. A removal tells this use to drop
+    // its current page, but does not make the triggering capture retrievable.
+    bool incremental_removal{};
     std::optional<Object> object;
     std::optional<std::string> meta;
 };
@@ -275,11 +278,17 @@ class Catalog {
         std::string_view canonical_url, Use use,
         std::optional<std::int64_t> as_of_unix_millis = std::nullopt);
 
-    // As retrieve(), but starts from the catalog's page identity. Used while
-    // walking recorded redirect targets.
+    // As retrieve(), but starts from the catalog's page identity.
     drogon::Task<std::optional<CrawlResult>> retrieve_page(
         std::int64_t page_id, Use use,
         std::optional<std::int64_t> as_of_unix_millis = std::nullopt);
+
+    // Resolves several redirect targets against one catalog watermark in a
+    // single recursive query. Results correspond positionally to target page
+    // IDs and contain each target capture followed by further redirect hops.
+    drogon::Task<std::vector<std::vector<CrawlResult>>> redirect_chains(
+        const std::vector<std::int64_t>& target_page_ids, Use use,
+        std::int64_t as_of_unix_millis, std::size_t maximum_hops = 16);
 
     // An immutable capture address scoped to its canonical page URL.
     drogon::Task<std::optional<CrawlResult>> capture(std::string_view canonical_url,
@@ -287,10 +296,10 @@ class Catalog {
 
     // Oldest first within (after, through], with an exclusive stable cursor
     // suitable for resumption.  Repeated captures whose status, metadata,
-    // redirect state, and body are unchanged from this use's prior eligible
-    // capture are omitted; archive history retains every capture. When set,
-    // maximum_body_bytes omits captures with larger bodies but retains
-    // bodyless results such as redirects.
+    // redirect state, and body are unchanged are omitted; transitions from
+    // eligible to ineligible are returned as incremental removals. Archive
+    // history retains every capture. When set, maximum_body_bytes omits
+    // larger upserts but never removals; bodyless results are retained.
     drogon::Task<std::vector<CrawlResult>> since(SinceCursor after,
                                                  std::int64_t through_unix_millis, Use use,
                                                  std::size_t limit = 1000,

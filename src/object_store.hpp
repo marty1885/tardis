@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "catalog.hpp"
 
@@ -29,6 +30,10 @@ class ObjectStore {
     [[nodiscard]] bool contains(const Hash256& blake2b_256) const;
     [[nodiscard]] std::string get(const Hash256& blake2b_256,
                                   std::int64_t expected_raw_bytes) const;
+    // Fetches a batch in physical hash order and returns bodies in caller
+    // order. Duplicate hashes are read and decompressed only once.
+    [[nodiscard]] std::vector<std::string> get_many(
+        const std::vector<Object>& objects) const;
 
    private:
     sqlite3* db_{};

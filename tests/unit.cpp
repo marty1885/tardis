@@ -117,6 +117,8 @@ int main() {
     const auto security_txt = tardis::Url::parse("gemini://example.org/.well-known/security.txt");
     assert(security_txt && Crawler::is_security_txt(*security_txt));
     assert(Crawler::robots_permissions("/anything", "User-agent: *\nDisallow: /\n") == 0);
+    assert(Crawler::robots_permissions("/robots.txt", "User-agent: *\nDisallow: /\n") ==
+           0x1f);
     assert(Crawler::robots_permissions("/public", "User-agent: *\nDisallow: /private\n") ==
            0x1f);
     const auto split_permissions = Crawler::robots_permissions(
@@ -204,11 +206,25 @@ int main() {
     second_digest.fill(std::byte{0x2b});
     store.put(second_digest, second_raw);
     assert(store.get(second_digest, second_raw.size()) == second_raw);
+    const auto batch = store.get_many({
+        {.blake2b_256 = second_digest, .raw_bytes = static_cast<std::int64_t>(second_raw.size())},
+        {.blake2b_256 = digest, .raw_bytes = static_cast<std::int64_t>(raw.size())},
+        {.blake2b_256 = second_digest, .raw_bytes = static_cast<std::int64_t>(second_raw.size())},
+    });
+    assert(batch.size() == 3 && batch[0] == second_raw && batch[1] == raw &&
+           batch[2] == second_raw);
     tardis::Hash256 compressed_digest;
     compressed_digest.fill(std::byte{0x2c});
     const std::string repetitive(8192, 'x');
     store.put(compressed_digest, repetitive);
     assert(store.get(compressed_digest, repetitive.size()) == repetitive);
+    // Serving opens an independent read-only handle and enables mmap on it.
+    // Keep the writable handle open to exercise the same WAL arrangement used
+    // when the crawler and server share a live snapshot.
+    {
+        tardis::ObjectStore serving_store(snapshot, false);
+        assert(serving_store.get(compressed_digest, repetitive.size()) == repetitive);
+    }
     sqlite3* object_db{};
     assert(sqlite3_open((snapshot / "objects.sqlite3").c_str(), &object_db) == SQLITE_OK);
     sqlite3_stmt* page_size{};
