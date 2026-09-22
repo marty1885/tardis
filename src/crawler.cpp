@@ -540,6 +540,9 @@ std::vector<RobotsRule> Crawler::robots_rules(std::string_view source, Use use) 
         group = {};
     };
     while (std::getline(lines, line)) {
+        // Gemini robots files commonly use CRLF; drogon::utils::trim only
+        // removes spaces and tabs, leaving a CR in rule paths otherwise.
+        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
         if (const auto hash = line.find('#'); hash != std::string::npos)
             line.resize(hash);
         line = drogon::utils::trim(std::move(line));

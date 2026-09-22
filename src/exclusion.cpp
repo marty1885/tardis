@@ -240,6 +240,9 @@ bool excluded_by_policy(const Url& url, std::string_view* reason) {
     if (std::find(kHosts.begin(), kHosts.end(), url.host()) != kHosts.end() ||
         std::find(kDeadHosts.begin(), kDeadHosts.end(), url.host()) != kDeadHosts.end())
         return reject("host");
+    if (url.host() == "buffering.party" &&
+        (url.path() == "/tarpit" || starts(url.path(), "/tarpit/")))
+        return reject("tarpit");
     const auto text = url.str();
     if (std::any_of(kPrefixes.begin(), kPrefixes.end(),
                     [&](auto prefix) { return starts(text, prefix); }))

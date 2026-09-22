@@ -121,6 +121,10 @@ int main() {
            0x1f);
     assert(Crawler::robots_permissions("/public", "User-agent: *\nDisallow: /private\n") ==
            0x1f);
+    const std::string_view crlf_robots =
+        "User-Agent: *\r\nDisallow: /tarpit\r\nDisallow: /tarpit/\r\n";
+    assert(Crawler::robots_permissions("/tarpit/1j8", crlf_robots) == 0);
+    assert(Crawler::robots_permissions("/outside", crlf_robots) == 0x1f);
     const auto split_permissions = Crawler::robots_permissions(
         "/native", "User-agent: *\nDisallow: /all\n\nUser-agent: tardis\nDisallow: /native\n");
     assert((split_permissions & static_cast<std::uint16_t>(tardis::Use::indexer)) == 0);
@@ -158,6 +162,14 @@ int main() {
     auto apple_archive = tardis::Url::parse("gemini://mirrors.apple2.org.za/active/4am/");
     assert(apple_archive && tardis::excluded_by_policy(*apple_archive, &exclusion) &&
            exclusion == "known-unbounded-or-mirror");
+    for (const auto* target : {"gemini://buffering.party/tarpit",
+                               "gemini://buffering.party/tarpit/1j8"}) {
+        const auto tarpit = tardis::Url::parse(target);
+        assert(tarpit && tardis::excluded_by_policy(*tarpit, &exclusion) &&
+               exclusion == "tarpit");
+    }
+    const auto nearby = tardis::Url::parse("gemini://buffering.party/tarpit-info");
+    assert(nearby && !tardis::excluded_by_policy(*nearby));
     auto search_query = tardis::Url::parse("gemini://sava.rocks/search/?debian");
     assert(search_query && tardis::excluded_by_policy(*search_query, &exclusion) &&
            exclusion == "search-query");
