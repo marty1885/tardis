@@ -116,6 +116,7 @@ constexpr auto kPrefixes =
                                      "gemini://gemini.autonomy.earth/current_month/archive/",
                                      "gemini://gemhoo.zone/mirrors/textfiles/",
                                      "gemini://r13.xyz/games/bell-below/",
+                                     "gemini://neuz.r13.xyz/month/",
                                      "gemini://kennedy.gemi.dev/observatory/",
                                      "gemini://kennedy.gemi.dev/page-info?",
                                      "gemini://kennedy.gemi.dev/reports/",
