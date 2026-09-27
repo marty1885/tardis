@@ -156,6 +156,15 @@ int main() {
     auto apple_archive = tardis::Url::parse("gemini://mirrors.apple2.org.za/active/4am/");
     assert(apple_archive && tardis::excluded_by_policy(*apple_archive, &exclusion) &&
            exclusion == "known-unbounded-or-mirror");
+    auto neuz_month = tardis::Url::parse("gemini://neuz.r13.xyz/month/2026/09");
+    assert(neuz_month && tardis::excluded_by_policy(*neuz_month, &exclusion) &&
+           exclusion == "known-unbounded-or-mirror");
+    auto neuz_home = tardis::Url::parse("gemini://neuz.r13.xyz/");
+    assert(neuz_home && !tardis::excluded_by_policy(*neuz_home));
+    auto neuz_monthly = tardis::Url::parse("gemini://neuz.r13.xyz/monthly/");
+    assert(neuz_monthly && !tardis::excluded_by_policy(*neuz_monthly));
+    auto other_month = tardis::Url::parse("gemini://other.r13.xyz/month/2026/09");
+    assert(other_month && !tardis::excluded_by_policy(*other_month));
     auto search_query = tardis::Url::parse("gemini://sava.rocks/search/?debian");
     assert(search_query && tardis::excluded_by_policy(*search_query, &exclusion) &&
            exclusion == "search-query");
